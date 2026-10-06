@@ -29,6 +29,12 @@ JOIN_SQL = (
 # 同时包含中文、逗号与双引号，用于验证 CSV 字段引用
 NOTE_VALUE = '中文,含"引号"'
 
+# 单条 SELECT 边界回归的可重复样例：字面量与引号别名中同时含有分号和
+# 注释标记，用于证明引号内文本既不参与多语句切分，也不会被注释剥离改动
+BOUNDARY_VALUE = "中文;--/*备注*/"
+BOUNDARY_HEADER = "列;名"
+BOUNDARY_SQL = "SELECT '%s' AS \"%s\"" % (BOUNDARY_VALUE, BOUNDARY_HEADER)
+
 
 class ReportTestCase(unittest.TestCase):
     """直接调用 export_csv 的行为测试。"""
@@ -132,6 +138,152 @@ class ReportTestCase(unittest.TestCase):
         # 仍输出同样的表头，但没有任何数据记录
         self.assertEqual(rows, [["姓名", "备注"]])
 
+    # -- 单条 SELECT 输入边界：允许的写法 --------------------------------
+
+    def _assert_boundary_csv(self, out, expected_count=1):
+        """核对边界样例 CSV：一行数据、表头与唯一字段完整保留。"""
+        self.assertTrue(os.path.isfile(out))
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows[0], [BOUNDARY_HEADER])
+        self.assertEqual(rows[1], [BOUNDARY_VALUE])
+        # 完整字段核对：恰好表头 + 一行数据，每行恰好一列
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(len(row) == 1 for row in rows))
+        # CSV 原文中引号内的注释标记与分号必须原样保留
+        with open(out, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        self.assertIn(BOUNDARY_VALUE, text)
+
+    def test_boundary_leading_and_trailing_whitespace(self):
+        out = os.path.join(self.tmpdir, "boundary_ws.csv")
+        count = report.export_csv(
+            self.db_path, "  \t\n " + BOUNDARY_SQL + " \n\t  ", out
+        )
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_lowercase_select_keyword(self):
+        out = os.path.join(self.tmpdir, "boundary_lower.csv")
+        count = report.export_csv(
+            self.db_path,
+            "  " + BOUNDARY_SQL.replace("SELECT", "select", 1) + "  ",
+            out,
+        )
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_mixed_case_select_keyword(self):
+        out = os.path.join(self.tmpdir, "boundary_mixed.csv")
+        count = report.export_csv(
+            self.db_path,
+            "\t SeLeCt '%s' AS \"%s\";\n" % (BOUNDARY_VALUE, BOUNDARY_HEADER),
+            out,
+        )
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_single_trailing_semicolon(self):
+        out = os.path.join(self.tmpdir, "boundary_semicolon.csv")
+        count = report.export_csv(self.db_path, BOUNDARY_SQL + ";", out)
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_line_comments_outside_statement(self):
+        out = os.path.join(self.tmpdir, "boundary_line_comment.csv")
+        # 注释里故意放入分号，不能被当成多语句切分
+        sql = (
+            "-- 前置行注释；含分号;\n"
+            "  " + BOUNDARY_SQL + "  -- 尾随行注释；也含分号;\n"
+        )
+        count = report.export_csv(self.db_path, sql, out)
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_block_comments_outside_statement(self):
+        out = os.path.join(self.tmpdir, "boundary_block_comment.csv")
+        sql = (
+            "/* 前置块注释；含分号 ; 与嵌套外观 -- */\n"
+            + BOUNDARY_SQL
+            + "\n/* 尾随块注释；含 ; 分号 */"
+        )
+        count = report.export_csv(self.db_path, sql, out)
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_block_comment_between_select_and_expression(self):
+        # 关键字与表达式之间的块注释应与普通空白分隔效果一致
+        out = os.path.join(self.tmpdir, "boundary_mid_block.csv")
+        sql = "SELECT/* 分隔注释 ; */ '%s' AS \"%s\"" % (
+            BOUNDARY_VALUE,
+            BOUNDARY_HEADER,
+        )
+        count = report.export_csv(self.db_path, sql, out)
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_semicolons_inside_quotes_are_not_statement_breaks(self):
+        out = os.path.join(self.tmpdir, "boundary_quoted_semicolons.csv")
+        # 语句前后再各加一条含分号的注释，集中验证分号判定只认真实分隔符
+        sql = (
+            "-- ;前;注;释;\n"
+            + BOUNDARY_SQL
+            + " /* ;块;注;释; */ -- ;行;注;释;\n"
+        )
+        count = report.export_csv(self.db_path, sql, out)
+        self.assertEqual(count, 1)
+        self._assert_boundary_csv(out)
+
+    def test_boundary_block_comment_inside_keyword_is_rejected(self):
+        out = os.path.join(self.tmpdir, "boundary_split_keyword.csv")
+        self.assertFalse(os.path.exists(out))
+        # 去除注释不得把 SE/*分隔*/LECT 重新拼成 SELECT
+        with self.assertRaises(ValueError):
+            report.export_csv(self.db_path, "SE/*分隔*/LECT 1", out)
+        self.assertFalse(os.path.exists(out))
+
+    # -- 单条 SELECT 输入边界：被拒绝的语句形式 --------------------------
+
+    def _assert_rejected_without_file(self, sql):
+        seq = getattr(self, "_reject_seq", 0) + 1
+        self._reject_seq = seq
+        out = os.path.join(self.tmpdir, "rejected_%02d.csv" % seq)
+        self.assertFalse(os.path.exists(out))
+        with self.assertRaises(ValueError):
+            report.export_csv(self.db_path, sql, out)
+        # 拒绝路径绝不产生目标 CSV
+        self.assertFalse(os.path.exists(out))
+
+    def test_reject_blank_or_comment_only_inputs(self):
+        for sql in ("", "   \n\t  ", "-- 只有一条行注释\n", "/* 只有块注释 */"):
+            with self.subTest(sql=sql):
+                self._assert_rejected_without_file(sql)
+
+    def test_reject_leading_semicolon(self):
+        self._assert_rejected_without_file("; " + BOUNDARY_SQL)
+
+    def test_reject_two_trailing_semicolons(self):
+        self._assert_rejected_without_file(BOUNDARY_SQL + ";;")
+
+    def test_reject_two_select_statements(self):
+        self._assert_rejected_without_file(
+            BOUNDARY_SQL + "; SELECT 1 AS another"
+        )
+
+    def test_reject_select_followed_by_update(self):
+        self._assert_rejected_without_file(
+            "SELECT id, name FROM people; UPDATE people SET name='x' WHERE id=1"
+        )
+
+    def test_reject_with_pragma_explain_and_bare_update(self):
+        for sql in (
+            "WITH cte AS (SELECT 1 AS x) SELECT x FROM cte",
+            "PRAGMA table_info(people)",
+            "EXPLAIN SELECT 1",
+            "UPDATE people SET name='x' WHERE id=1",
+        ):
+            with self.subTest(sql=sql):
+                self._assert_rejected_without_file(sql)
+
     # -- SQL 错误 --------------------------------------------------------
 
     def test_invalid_sql_raises_valueerror_and_creates_no_file(self):
@@ -202,6 +354,36 @@ class ReportTestCase(unittest.TestCase):
         self.assertIn("已存在", proc.stderr)
         with open(out, "rb") as f:
             self.assertEqual(f.read(), original_bytes)
+
+    def test_cli_legal_boundary_sample_exits_zero_and_reports_one_row(self):
+        out = os.path.join(self.tmpdir, "cli_boundary.csv")
+        sql = (
+            "-- 前置注释；含分号;\n"
+            + BOUNDARY_SQL
+            + "; -- 尾随行注释；含分号;\n"
+        )
+        proc = self._run_cli(sql, out)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 成功提示报告恰为一行，并给出输出路径
+        self.assertIn("1", proc.stdout)
+        self.assertIn("行", proc.stdout)
+        self.assertIn(out, proc.stdout)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [[BOUNDARY_HEADER], [BOUNDARY_VALUE]])
+
+    def test_cli_multi_statement_rejected_exit_one_stderr_no_success(self):
+        out = os.path.join(self.tmpdir, "cli_multi.csv")
+        self.assertFalse(os.path.exists(out))
+        proc = self._run_cli(BOUNDARY_SQL + "; SELECT 1 AS another", out)
+
+        self.assertEqual(proc.returncode, 1)
+        # 拒绝原因写到标准错误
+        self.assertIn("错误", proc.stderr)
+        self.assertIn("语句", proc.stderr)
+        # 标准输出不出现成功提示，目标文件不产生
+        self.assertNotIn("已导出", proc.stdout)
+        self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":
