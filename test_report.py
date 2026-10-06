@@ -1248,5 +1248,325 @@ class ParamTestCase(unittest.TestCase):
         self.assertFalse(os.path.exists(out))
 
 
+# --null-text 专项回归的固定样例：编号 1 至 4，备注依次为
+# SQL NULL、空字符串、与标记同形的普通文本、普通中文
+NULLTEXT_SQL = "SELECT id AS 编号, note AS 备注 FROM records ORDER BY id"
+# 借助现有命名参数只选中 NULL 所在的记录
+NULLTEXT_WHERE_SQL = (
+    "SELECT id AS 编号, note AS 备注 FROM records "
+    "WHERE id = :id ORDER BY id"
+)
+NULLTEXT_PLAIN_MARKER = "未填写"
+# 同时含中文、首尾空格、逗号、双引号与换行：经 csv.reader 必须完整还原
+NULLTEXT_COMPLEX_MARKER = ' 标记,含"引号"中文\n第二行 '
+# 省略标记（默认空字段）时的完整期望：表头 + 四条数据
+NULLTEXT_EXPECTED_DEFAULT = [
+    ["编号", "备注"],
+    ["1", ""],
+    ["2", ""],
+    ["3", "未填写"],
+    ["4", "普通中文"],
+]
+# 标记为“未填写”时的完整期望：仅 NULL 被替换
+NULLTEXT_EXPECTED_PLAIN = [
+    ["编号", "备注"],
+    ["1", NULLTEXT_PLAIN_MARKER],
+    ["2", ""],
+    ["3", NULLTEXT_PLAIN_MARKER],
+    ["4", "普通中文"],
+]
+
+
+class NullTextTestCase(unittest.TestCase):
+    """--null-text / export_csv 的 null_text 参数专项回归测试。
+
+    固定样例库只有一张 records 表：四条备注依次为 SQL NULL、空字符串、
+    与标记同形的普通文本与普通中文。每个用例独立准备临时目录与输出文件，
+    tearDown 重新以只读连接核对源库结构与全部数据相对基线零变化；
+    使用查询文件的用例另行核对文件字节未变。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "nulltext.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，tearDown 中逐一核对
+        self._baseline = self._snapshot_db()
+
+    def tearDown(self):
+        # 每个用例（无论成功或失败）结束后，重新只读打开源库，
+        # 核对表结构及全部数据与准备完成时完全一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE records (id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            # 备注依次为：SQL NULL、空字符串、普通文本“未填写”、普通中文
+            conn.executemany(
+                "INSERT INTO records (id, note) VALUES (?, ?)",
+                [(1, None), (2, ""), (3, "未填写"), (4, "普通中文")],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        """以只读方式重新读取源库的表结构与 records 全部数据。"""
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            records = conn.execute(
+                "SELECT id, note FROM records ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "records": records}
+
+    @staticmethod
+    def _read_csv(path):
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        return text, list(csv.reader(io.StringIO(text)))
+
+    def _write_sql_file(self, content, name="查询.sql"):
+        """按 UTF-8 写查询文件，返回 (路径, 写入字节) 以便用后核对。"""
+        path = os.path.join(self.tmpdir, name)
+        payload = content.encode("utf-8") if isinstance(content, str) else content
+        with open(path, "wb") as f:
+            f.write(payload)
+        return path, payload
+
+    def _run_cli(self, output, sql=None, sql_file=None,
+                 null_text=NULLTEXT_PLAIN_MARKER, params=()):
+        cmd = [sys.executable, REPORT_PY, "--db", self.db_path]
+        if sql is not None:
+            cmd += ["--sql", sql]
+        if sql_file is not None:
+            cmd += ["--sql-file", sql_file]
+        cmd += ["--output", output, "--null-text", null_text]
+        for item in params:
+            cmd += ["--param", item]
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    # -- 函数入口：省略标记与显式空字符串等价 ------------------------------
+
+    def test_default_and_explicit_empty_marker_produce_identical_bytes(self):
+        out_default = os.path.join(self.tmpdir, "default.csv")
+        out_empty = os.path.join(self.tmpdir, "empty_marker.csv")
+
+        count_default = report.export_csv(self.db_path, NULLTEXT_SQL, out_default)
+        count_empty = report.export_csv(
+            self.db_path, NULLTEXT_SQL, out_empty, null_text=""
+        )
+        # 两种调用均返回全部数据行数
+        self.assertEqual(count_default, 4)
+        self.assertEqual(count_empty, 4)
+
+        # 省略标记与显式传入空字符串：CSV 字节内容完全相同
+        with open(out_default, "rb") as f:
+            default_bytes = f.read()
+        with open(out_empty, "rb") as f:
+            self.assertEqual(f.read(), default_bytes)
+
+        _, rows = self._read_csv(out_default)
+        # 列名与列顺序固定；前两条备注（NULL 与空字符串）均为空字段
+        self.assertEqual(rows, NULLTEXT_EXPECTED_DEFAULT)
+
+    # -- 函数入口：自定义标记只替换 NULL -----------------------------------
+
+    def test_marker_replaces_null_but_empty_string_stays_empty(self):
+        out = os.path.join(self.tmpdir, "marker.csv")
+        count = report.export_csv(
+            self.db_path, NULLTEXT_SQL, out, null_text=NULLTEXT_PLAIN_MARKER
+        )
+        self.assertEqual(count, 4)
+
+        _, rows = self._read_csv(out)
+        # 仅第一条（NULL）被替换；第二条（空字符串）仍为空字段；
+        # 第三条恰好与标记同形的普通文本原样保留，列名/行顺序/其余值不变
+        self.assertEqual(rows, NULLTEXT_EXPECTED_PLAIN)
+
+        # 物理 CSV 层面：标记按普通文本写入，不增加引号等转义前缀；
+        # NULL 替换值与同形普通文本的字节形态完全一致
+        with open(out, "rb") as f:
+            data = f.read()
+        self.assertIn(
+            ("1," + NULLTEXT_PLAIN_MARKER + "\r\n").encode("utf-8"), data
+        )
+        self.assertIn(
+            ("3," + NULLTEXT_PLAIN_MARKER + "\r\n").encode("utf-8"), data
+        )
+        self.assertNotIn(
+            ('"' + NULLTEXT_PLAIN_MARKER + '"').encode("utf-8"), data
+        )
+
+    # -- 函数入口：含空格/逗号/引号/换行的标记经 csv.reader 完整还原 -------
+
+    def test_complex_marker_roundtrips_through_csv_reader(self):
+        out = os.path.join(self.tmpdir, "complex_marker.csv")
+        count = report.export_csv(
+            self.db_path, NULLTEXT_SQL, out, null_text=NULLTEXT_COMPLEX_MARKER
+        )
+        self.assertEqual(count, 4)
+
+        text, rows = self._read_csv(out)
+        # csv.reader 按逻辑记录解析：表头 + 四条数据；标记首尾空格、逗号、
+        # 双引号与内嵌换行全部完整还原，空字符串与其他值不受影响
+        self.assertEqual(
+            rows,
+            [
+                ["编号", "备注"],
+                ["1", NULLTEXT_COMPLEX_MARKER],
+                ["2", ""],
+                ["3", "未填写"],
+                ["4", "普通中文"],
+            ],
+        )
+        self.assertEqual(len(rows), 5)
+        # 标记内嵌换行使物理行数多于逻辑记录数：不能按物理行数计算记录数
+        self.assertGreater(len(text.splitlines()), len(rows))
+        # 标记只作用于数据单元格，表头行保持原样
+        self.assertTrue(text.startswith("编号,备注\r\n"))
+
+    # -- 函数入口：筛选不到记录 --------------------------------------------
+
+    def test_empty_result_header_only_returns_zero(self):
+        out = os.path.join(self.tmpdir, "zero.csv")
+        sql = (
+            "SELECT id AS 编号, note AS 备注 FROM records "
+            "WHERE id < 0 ORDER BY id"
+        )
+        count = report.export_csv(
+            self.db_path, sql, out, null_text=NULLTEXT_PLAIN_MARKER
+        )
+        self.assertEqual(count, 0)
+        _, rows = self._read_csv(out)
+        # 仍保留表头（列名与列顺序），但没有任何数据记录
+        self.assertEqual(rows, [["编号", "备注"]])
+
+    # -- 函数入口：非字符串标记被拒绝 --------------------------------------
+
+    def test_non_string_null_text_rejected_without_file(self):
+        for bad in (None, 1, True):
+            with self.subTest(null_text=bad):
+                out = os.path.join(self.tmpdir, "bad_null_%r.csv" % (bad,))
+                self.assertFalse(os.path.exists(out))
+                with self.assertRaises(ValueError):
+                    report.export_csv(
+                        self.db_path, NULLTEXT_SQL, out, null_text=bad
+                    )
+                # 拒绝路径绝不产生目标 CSV
+                self.assertFalse(os.path.exists(out))
+
+    # -- 拒绝覆盖既有输出文件的行为保持不变 --------------------------------
+
+    def test_existing_target_rejected_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "existing.csv")
+        original_bytes = "已有内容，不得覆盖\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original_bytes)
+
+        with self.assertRaises(ValueError):
+            report.export_csv(
+                self.db_path,
+                NULLTEXT_SQL,
+                out,
+                null_text=NULLTEXT_COMPLEX_MARKER,
+            )
+
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+
+    # -- 命令行：--sql 传入标记 --------------------------------------------
+
+    def test_cli_sql_null_text_matches_function_result(self):
+        out = os.path.join(self.tmpdir, "cli_sql_marker.csv")
+        proc = self._run_cli(out, sql=NULLTEXT_SQL)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        # 成功信息包含实际数据行数与输出路径
+        self.assertIn("已导出 4 行数据", proc.stdout)
+        self.assertIn(out, proc.stdout)
+        # 逻辑记录与函数调用完全一致
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, NULLTEXT_EXPECTED_PLAIN)
+
+    # -- 命令行：--sql-file 传入标记 ---------------------------------------
+
+    def test_cli_sql_file_null_text_matches_function_result(self):
+        sql_path, payload = self._write_sql_file(NULLTEXT_SQL)
+        out = os.path.join(self.tmpdir, "cli_file_marker.csv")
+        proc = self._run_cli(out, sql_file=sql_path)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertIn("已导出 4 行数据", proc.stdout)
+        self.assertIn(out, proc.stdout)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, NULLTEXT_EXPECTED_PLAIN)
+        # 查询文件只被读取，字节未变
+        with open(sql_path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    # -- 命令行：查询文件 + 现有命名参数只选中 NULL 记录 --------------------
+
+    def test_cli_sql_file_param_selects_null_row_with_marker(self):
+        sql_path, payload = self._write_sql_file(
+            NULLTEXT_WHERE_SQL + ";\n", name="参数查询.sql"
+        )
+        out = os.path.join(self.tmpdir, "cli_param_null.csv")
+        proc = self._run_cli(out, sql_file=sql_path, params=["id=1"])
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertIn("已导出 1 行数据", proc.stdout)
+        self.assertIn(out, proc.stdout)
+        _, rows = self._read_csv(out)
+        # 恰好表头 + 一条数据，NULL 被标记替换
+        self.assertEqual(rows, [["编号", "备注"], ["1", NULLTEXT_PLAIN_MARKER]])
+        with open(sql_path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    # -- 命令行：--null-text 缺少值 ----------------------------------------
+
+    def test_cli_missing_null_text_value_exit_one_empty_stdout(self):
+        out = os.path.join(self.tmpdir, "cli_no_marker_value.csv")
+        self.assertFalse(os.path.exists(out))
+        # --null-text 放在末尾使其后面无值可消费，触发缺值错误
+        cmd = [
+            sys.executable,
+            REPORT_PY,
+            "--db",
+            self.db_path,
+            "--sql",
+            NULLTEXT_SQL,
+            "--output",
+            out,
+            "--null-text",
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+        self.assertEqual(proc.returncode, 1)
+        # 拒绝原因写入标准错误，并指出缺值的选项
+        self.assertIn("错误", proc.stderr)
+        self.assertIn("--null-text", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()
