@@ -3,10 +3,13 @@
 
 用法:
     python report.py --db DB.sqlite --sql "SELECT ..." --output out.csv
+    python report.py --db DB.sqlite --sql-file query.sql --output out.csv
 
-仅接受一条 SELECT 语句（允许首尾空白与结尾分号）；WITH、PRAGMA、写入
-语句及多语句输入一律拒绝。数据库以只读方式打开，缺失时不会创建；输出
-目标已存在时拒绝写入，绝不覆盖或截断。
+--sql 与 --sql-file 必须恰好选择一个；查询文件按 UTF-8 读取（允许开头
+一个 BOM），文件内容适用与 --sql 完全相同的规则。仅接受一条 SELECT
+语句（允许首尾空白与结尾分号）；WITH、PRAGMA、写入语句及多语句输入
+一律拒绝。数据库以只读方式打开，缺失时不会创建；输出目标已存在时拒绝
+写入，绝不覆盖或截断；查询文件只被读取，绝不改写。
 """
 
 import argparse
@@ -189,6 +192,28 @@ def validate_single_select(sql, _depth=0):
     return statement
 
 
+def read_sql_file(path):
+    """读取查询文件文本：按 UTF-8 解码，允许开头恰一个 BOM；失败抛 ValueError。
+
+    文件只被读取，绝不改写；路径可包含中文与空格。读到的文本与 --sql
+    适用完全相同的 SQL 规则（由 validate_single_select 统一校验）。
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise ValueError("查询文件不存在：%s" % path)
+    except IsADirectoryError:
+        raise ValueError("查询文件路径是目录而非文件：%s" % path)
+    except OSError as exc:
+        raise ValueError("无法读取查询文件 %s：%s" % (path, exc))
+    try:
+        # utf-8-sig 仅在开头恰有一个 BOM 时将其剥除，其余字节原样解码
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("查询文件不是有效的 UTF-8 文本 %s：%s" % (path, exc))
+
+
 def open_readonly(db_path):
     """以只读模式打开 SQLite；文件缺失或损坏时抛 ValueError，且绝不会创建新库。"""
     uri = Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
@@ -262,15 +287,29 @@ def parse_args(argv):
         description="对 SQLite 执行一条只读 SELECT 并导出带列名的 CSV"
     )
     parser.add_argument("--db", required=True, help="已有 SQLite 数据库文件路径")
-    parser.add_argument("--sql", required=True, help="一条 SELECT 查询文本")
+    parser.add_argument("--sql", help="一条 SELECT 查询文本")
+    parser.add_argument(
+        "--sql-file", help="包含一条 SELECT 查询的 UTF-8 文件路径（允许一个 BOM）"
+    )
     parser.add_argument("--output", required=True, help="输出 CSV 路径（不得已存在）")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # 恰好选择一个查询来源；此判定发生在读文件与开库之前
+    if (args.sql is None) == (args.sql_file is None):
+        parser.error("--sql 与 --sql-file 必须恰好选择一个")
+    return args
 
 
 def main(argv=None):
     args = parse_args(argv)
+    sql_text = args.sql
+    if sql_text is None:
+        # 先读查询文件：文件类失败时不接触源库与输出目标
+        try:
+            sql_text = read_sql_file(args.sql_file)
+        except ValueError as exc:
+            die(str(exc))
     try:
-        row_count = export_csv(args.db, args.sql, args.output)
+        row_count = export_csv(args.db, sql_text, args.output)
     except ValueError as exc:
         die(str(exc))
     except sqlite3.Error as exc:
