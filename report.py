@@ -20,6 +20,12 @@ ASCII 字母或下划线，后续仅含 ASCII 字母、数字或下划线。值�
 绑定（数字、null、布尔词不转换类型），只作为数据参与查询，绝不拼接进
 SQL 文本。字符串与注释中的类似文本不算参数；未被查询引用的合法参数
 忽略；缺少查询引用的参数、或使用 ?、?1 位置占位符，均拒绝。
+
+--null-text 可指定数据单元格中 SQL NULL 的导出标记：标记作为纯文本
+原样写入（可为空，可含中文、首尾空格、逗号、双引号和换行，遵循常规
+CSV 引用规则）；省略或显式给空字符串时 NULL 仍写为空字段。该设置只
+替换 NULL 单元格，不影响列名、列顺序、行顺序、非空值（包括空字符串
+与恰好同标记的普通文本）与数据行数。
 """
 
 import argparse
@@ -350,14 +356,24 @@ def open_readonly(db_path):
     return conn
 
 
-def export_csv(db_path, sql_text, output_path, params=None):
+def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
 
     params 为可选的 名称->文本 参数字典（键不带占位符前缀），为查询中的
     :name、@name、$name 命名参数提供值；省略或传入 None 时与不提供参数
     的原有调用行为完全一致。值只作为绑定数据参与查询，绝不拼进 SQL 文本。
+
+    null_text 为可选的 SQL NULL 导出标记，必须是字符串；省略或传入空
+    字符串时 NULL 写为空字段（原有行为）。标记原样作为文本写入数据
+    单元格（可为中文、首尾空格、逗号、双引号、换行等任意文本），不做
+    类型转换；不影响列名、非空值（空字符串仍为空字段）、行列顺序与
+    返回行数。非字符串值抛 ValueError，且不会创建输出文件。
     """
     params = validate_params(params)
+    if not isinstance(null_text, str):
+        raise ValueError(
+            "null_text 必须是字符串，收到 %s" % type(null_text).__name__
+        )
     statement = validate_single_select(sql_text)
     bound = bind_params(statement, params)
 
@@ -390,7 +406,9 @@ def export_csv(db_path, sql_text, output_path, params=None):
             writer = csv.writer(f)
             writer.writerow(headers)
             for row in rows:
-                writer.writerow(["" if value is None else value for value in row])
+                writer.writerow(
+                    [null_text if value is None else value for value in row]
+                )
     except FileExistsError:
         raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
     except (OSError, UnicodeError, TypeError) as exc:
@@ -451,6 +469,13 @@ def parse_args(argv):
         metavar="name=value",
         help="查询命名参数的文本值，可重复；值在第一个等号后原样保留",
     )
+    parser.add_argument(
+        "--null-text",
+        metavar="TEXT",
+        default="",
+        help="数据单元格中 SQL NULL 的导出标记，原样作为文本写入；"
+        "省略时 NULL 写为空字段",
+    )
     args = parser.parse_args(argv)
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
@@ -469,7 +494,13 @@ def main(argv=None):
         except ValueError as exc:
             die(str(exc))
     try:
-        row_count = export_csv(args.db, sql_text, args.output, params=args.params)
+        row_count = export_csv(
+            args.db,
+            sql_text,
+            args.output,
+            params=args.params,
+            null_text=args.null_text,
+        )
     except ValueError as exc:
         die(str(exc))
     except sqlite3.Error as exc:
