@@ -36,8 +36,8 @@ BOUNDARY_HEADER = "列;名"
 BOUNDARY_SQL = "SELECT '%s' AS \"%s\"" % (BOUNDARY_VALUE, BOUNDARY_HEADER)
 
 
-class ReportTestCase(unittest.TestCase):
-    """直接调用 export_csv 的行为测试。"""
+class SampleDbTestCase(unittest.TestCase):
+    """people/notes 两表样例库夹具：准备、只读快照核对与 CSV 读取。"""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -101,6 +101,10 @@ class ReportTestCase(unittest.TestCase):
         with open(path, "r", encoding="utf-8", newline="") as f:
             text = f.read()
         return text, list(csv.reader(io.StringIO(text)))
+
+
+class ReportTestCase(SampleDbTestCase):
+    """直接调用 export_csv 的行为测试。"""
 
     # -- 正常导出 --------------------------------------------------------
 
@@ -384,6 +388,258 @@ class ReportTestCase(unittest.TestCase):
         # 标准输出不出现成功提示，目标文件不产生
         self.assertNotIn("已导出", proc.stdout)
         self.assertFalse(os.path.exists(out))
+
+
+class SqlFileTestCase(SampleDbTestCase):
+    """--sql-file 查询文件入口的命令行回归测试。
+
+    查询文件一律在临时目录内现写现用；运行前后逐字节核对文件内容，
+    确认入口只读取、绝不改写查询文件。
+    """
+
+    def _write_sql_file(self, name, content):
+        """在临时目录写入查询文件并返回路径；content 为 str（UTF-8）或 bytes。"""
+        path = os.path.join(self.tmpdir, name)
+        if isinstance(content, bytes):
+            with open(path, "wb") as f:
+                f.write(content)
+        else:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+        return path
+
+    def _run_cli(self, sql_args, output):
+        return subprocess.run(
+            [sys.executable, REPORT_PY, "--db", self.db_path]
+            + sql_args
+            + ["--output", output],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _read_bytes(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    def _assert_rejected(self, sql_args, out, *reason_parts):
+        """命令行拒绝的公共断言：退出码 1、错误前缀与原因在标准错误、
+        标准输出为空、不产生目标文件。"""
+        self.assertFalse(os.path.exists(out))
+        proc = self._run_cli(sql_args, out)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        for part in reason_parts:
+            self.assertIn(part, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+        return proc
+
+    # -- 正常导出：文件入口与内联 SQL 等价 --------------------------------
+
+    def test_sql_file_produces_same_csv_as_inline_sql(self):
+        query = self._write_sql_file("query.sql", JOIN_SQL)
+        out_file = os.path.join(self.tmpdir, "from_file.csv")
+        out_inline = os.path.join(self.tmpdir, "from_inline.csv")
+
+        proc_file = self._run_cli(["--sql-file", query], out_file)
+        proc_inline = self._run_cli(["--sql", JOIN_SQL], out_inline)
+
+        self.assertEqual(proc_file.returncode, 0, proc_file.stderr)
+        self.assertEqual(proc_inline.returncode, 0, proc_inline.stderr)
+        # 两种输入方式生成逐字节相同的 UTF-8 CSV
+        self.assertEqual(self._read_bytes(out_file), self._read_bytes(out_inline))
+
+        _, rows = self._read_csv(out_file)
+        # 列顺序为 姓名、备注；小明空备注在前，小红含逗号引号备注在后
+        self.assertEqual(rows[0], ["姓名", "备注"])
+        self.assertEqual(rows[1], ["小明", ""])
+        self.assertEqual(rows[2], ["小红", NOTE_VALUE])
+        self.assertEqual(len(rows), 3)
+        # 成功提示报告两条数据与输出路径
+        self.assertIn("2", proc_file.stdout)
+        self.assertIn("行", proc_file.stdout)
+        self.assertIn(out_file, proc_file.stdout)
+
+    def test_sql_file_with_utf8_bom(self):
+        query = self._write_sql_file(
+            "bom.sql", b"\xef\xbb\xbf" + JOIN_SQL.encode("utf-8")
+        )
+        out = os.path.join(self.tmpdir, "bom_out.csv")
+        proc = self._run_cli(["--sql-file", query], out)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows[0], ["姓名", "备注"])
+        self.assertEqual(len(rows), 3)
+
+    def test_sql_file_path_with_chinese_and_spaces(self):
+        subdir = os.path.join(self.tmpdir, "查询 目录")
+        os.mkdir(subdir)
+        query = self._write_sql_file(
+            os.path.join("查询 目录", "关联 查询.sql"), JOIN_SQL
+        )
+        out = os.path.join(self.tmpdir, "中文路径.csv")
+        proc = self._run_cli(["--sql-file", query], out)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, rows = self._read_csv(out)
+        self.assertEqual(len(rows), 3)
+
+    def test_sql_file_comments_whitespace_and_trailing_semicolon(self):
+        content = (
+            "-- 前置行注释；含分号;\n"
+            "/* 前置块注释；也含分号 ; */\n"
+            "  " + BOUNDARY_SQL + ";  -- 尾随行注释\n"
+        )
+        query = self._write_sql_file("decorated.sql", content)
+        out = os.path.join(self.tmpdir, "decorated.csv")
+        proc = self._run_cli(["--sql-file", query], out)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, rows = self._read_csv(out)
+        # 引号内的分号、注释标记与中文原样保留
+        self.assertEqual(rows, [[BOUNDARY_HEADER], [BOUNDARY_VALUE]])
+
+    def test_sql_file_empty_result_keeps_header_and_reports_zero(self):
+        sql = (
+            "SELECT p.name AS 姓名, n.note AS 备注 "
+            "FROM people p JOIN notes n ON p.id=n.person_id WHERE p.id < 0"
+        )
+        query = self._write_sql_file("none.sql", sql)
+        out = os.path.join(self.tmpdir, "none.csv")
+        proc = self._run_cli(["--sql-file", query], out)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("0", proc.stdout)
+        _, rows = self._read_csv(out)
+        # 筛选无记录时保留表头
+        self.assertEqual(rows, [["姓名", "备注"]])
+
+    def test_sql_file_is_never_modified(self):
+        content = "-- 注释\n" + JOIN_SQL + ";\n"
+        query = self._write_sql_file("readonly.sql", content)
+        before = self._read_bytes(query)
+        out = os.path.join(self.tmpdir, "ro.csv")
+
+        proc = self._run_cli(["--sql-file", query], out)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._read_bytes(query), before)
+
+    # -- 文件内 SQL 的既有校验规则不变 ------------------------------------
+
+    def test_empty_whitespace_and_comment_only_files_rejected(self):
+        cases = {
+            "empty.sql": "",
+            "blank.sql": "  \n\t \n",
+            "comments.sql": "-- 只有行注释\n/* 与块注释 */\n",
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                query = self._write_sql_file(name, content)
+                out = os.path.join(self.tmpdir, name + ".csv")
+                self._assert_rejected(["--sql-file", query], out, "SQL 为空")
+
+    def test_disallowed_statements_in_file_rejected(self):
+        cases = {
+            "with.sql": "WITH cte AS (SELECT 1 AS x) SELECT x FROM cte",
+            "pragma.sql": "PRAGMA table_info(people)",
+            "explain.sql": "EXPLAIN SELECT 1",
+            "update.sql": "UPDATE people SET name='x' WHERE id=1",
+            "multi.sql": JOIN_SQL + "; SELECT 1 AS another",
+        }
+        for name, content in cases.items():
+            with self.subTest(name=name):
+                query = self._write_sql_file(name, content)
+                out = os.path.join(self.tmpdir, name + ".csv")
+                self._assert_rejected(["--sql-file", query], out)
+
+    # -- 查询文件读取失败：路径与原因齐全，不碰源库与输出 ------------------
+
+    def test_missing_sql_file_rejected_with_path_and_reason(self):
+        query = os.path.join(self.tmpdir, "不存在.sql")
+        out = os.path.join(self.tmpdir, "missing.csv")
+        self._assert_rejected(["--sql-file", query], out, query, "不存在")
+
+    def test_sql_file_pointing_to_directory_rejected(self):
+        out = os.path.join(self.tmpdir, "dir.csv")
+        self._assert_rejected(
+            ["--sql-file", self.tmpdir], out, self.tmpdir, "目录"
+        )
+
+    def test_non_utf8_sql_file_rejected(self):
+        # GBK 编码的中文不是合法 UTF-8
+        query = self._write_sql_file("gbk.sql", "SELECT 1 AS 数值".encode("gbk"))
+        out = os.path.join(self.tmpdir, "gbk.csv")
+        self._assert_rejected(["--sql-file", query], out, query, "UTF-8")
+
+    def test_sql_file_read_error_happens_before_db_open(self):
+        # 查询文件与源库同时缺失时报查询文件：证明先读文件、未触碰源库
+        query = os.path.join(self.tmpdir, "没有.sql")
+        missing_db = os.path.join(self.tmpdir, "missing.sqlite")
+        out = os.path.join(self.tmpdir, "order.csv")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                REPORT_PY,
+                "--db",
+                missing_db,
+                "--sql-file",
+                query,
+                "--output",
+                out,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn(query, proc.stderr)
+        self.assertNotIn("数据库", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(missing_db))
+
+    # -- --sql 与 --sql-file 恰好选择一个 ---------------------------------
+
+    def test_both_sql_and_sql_file_rejected(self):
+        query = self._write_sql_file("both.sql", JOIN_SQL)
+        out = os.path.join(self.tmpdir, "both.csv")
+        self._assert_rejected(
+            ["--sql", JOIN_SQL, "--sql-file", query], out, "参数错误"
+        )
+
+    def test_neither_sql_nor_sql_file_rejected(self):
+        out = os.path.join(self.tmpdir, "neither.csv")
+        self._assert_rejected([], out, "参数错误")
+
+    # -- 输出目标的既有保护不变 --------------------------------------------
+
+    def test_missing_output_directory_not_created(self):
+        query = self._write_sql_file("nodir.sql", JOIN_SQL)
+        missing_dir = os.path.join(self.tmpdir, "不存在的目录")
+        out = os.path.join(missing_dir, "out.csv")
+        self._assert_rejected(["--sql-file", query], out, "目录")
+        self.assertFalse(os.path.exists(missing_dir))
+
+    def test_existing_output_not_overwritten(self):
+        query = self._write_sql_file("existing.sql", JOIN_SQL)
+        out = os.path.join(self.tmpdir, "existing.csv")
+        original = "已有内容，不得变化\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original)
+
+        proc = self._run_cli(["--sql-file", query], out)
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn("已存在", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        # 目标已存在时拒绝覆盖，原字节保持不变
+        self.assertEqual(self._read_bytes(out), original)
 
 
 # 普通文本伪装成数据库的固定输入：重复三十二次后加换行

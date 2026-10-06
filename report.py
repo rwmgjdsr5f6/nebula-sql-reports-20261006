@@ -3,10 +3,13 @@
 
 用法:
     python report.py --db DB.sqlite --sql "SELECT ..." --output out.csv
+    python report.py --db DB.sqlite --sql-file query.sql --output out.csv
 
-仅接受一条 SELECT 语句（允许首尾空白与结尾分号）；WITH、PRAGMA、写入
+--sql 与 --sql-file 必须恰好提供一个。查询文件按 UTF-8 读取（允许开头
+有一个 BOM），读到的文本与 --sql 遵循完全相同的 SQL 规则：仅接受一条
+SELECT 语句（允许首尾空白、引号外注释与结尾分号）；WITH、PRAGMA、写入
 语句及多语句输入一律拒绝。数据库以只读方式打开，缺失时不会创建；输出
-目标已存在时拒绝写入，绝不覆盖或截断。
+目标已存在时拒绝写入，绝不覆盖或截断；查询文件只被读取，绝不改写。
 """
 
 import argparse
@@ -205,6 +208,25 @@ def open_readonly(db_path):
     return conn
 
 
+def read_sql_file(path):
+    """按 UTF-8 读取查询文件（允许开头有一个 BOM），返回文本；失败抛 ValueError。
+
+    只读取、绝不改写查询文件；任何失败都不接触源库与输出目标。
+    """
+    try:
+        # utf-8-sig：开头恰有一个 BOM 时剥去，无 BOM 时按普通 UTF-8 解码
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return f.read()
+    except FileNotFoundError:
+        raise ValueError("查询文件不存在：%s" % path)
+    except IsADirectoryError:
+        raise ValueError("查询文件路径指向目录而非文件：%s" % path)
+    except UnicodeDecodeError as exc:
+        raise ValueError("查询文件不是有效的 UTF-8：%s（%s）" % (path, exc))
+    except OSError as exc:
+        raise ValueError("无法读取查询文件 %s：%s" % (path, exc))
+
+
 def export_csv(db_path, sql_text, output_path):
     """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。"""
     statement = validate_single_select(sql_text)
@@ -262,15 +284,27 @@ def parse_args(argv):
         description="对 SQLite 执行一条只读 SELECT 并导出带列名的 CSV"
     )
     parser.add_argument("--db", required=True, help="已有 SQLite 数据库文件路径")
-    parser.add_argument("--sql", required=True, help="一条 SELECT 查询文本")
+    # --sql 与 --sql-file 恰好选择一个；两者同给或都不给都由 argparse
+    # 走 _Parser.error，退出码 1、原因写标准错误，且不读文件、不碰源库
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--sql", help="一条 SELECT 查询文本")
+    source.add_argument(
+        "--sql-file", help="UTF-8 查询文件路径（允许开头 BOM），与 --sql 二选一"
+    )
     parser.add_argument("--output", required=True, help="输出 CSV 路径（不得已存在）")
     return parser.parse_args(argv)
 
 
 def main(argv=None):
     args = parse_args(argv)
+    sql_text = args.sql
+    if args.sql_file is not None:
+        try:
+            sql_text = read_sql_file(args.sql_file)
+        except ValueError as exc:
+            die(str(exc))
     try:
-        row_count = export_csv(args.db, args.sql, args.output)
+        row_count = export_csv(args.db, sql_text, args.output)
     except ValueError as exc:
         die(str(exc))
     except sqlite3.Error as exc:
