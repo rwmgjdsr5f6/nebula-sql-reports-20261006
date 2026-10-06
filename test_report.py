@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import report
 
@@ -723,6 +724,198 @@ class SqlFileTestCase(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         with open(out, "rb") as f:
             self.assertEqual(f.read(), original_bytes)
+
+
+# 写入故障的固定消息：可重复、与真实磁盘状态无关
+WRITE_FAIL_MESSAGE = "模拟写入故障：磁盘写入被拒绝"
+# 表头行落盘字节（csv 默认行尾为 \r\n），用于核对"表头已写入"时点
+HEADER_LINE_BYTES = "姓名,备注\r\n".encode("utf-8")
+
+
+class _FlakyFile:
+    """包装真实文件对象：前 fail_at - 1 次 write 正常落盘，第 fail_at 次抛固定 OSError。
+
+    用于在 export_csv 新建目标之后、按精确时点制造可重复的写入故障；
+    正常接受的写入立即 flush，使故障瞬间的真实落盘内容可被核对。
+    """
+
+    def __init__(self, real_file, fail_at, on_fail):
+        self._real = real_file
+        self._fail_at = fail_at
+        self._on_fail = on_fail
+        self._writes = 0
+
+    def write(self, data):
+        self._writes += 1
+        if self._writes == self._fail_at:
+            self._on_fail()
+            raise OSError(WRITE_FAIL_MESSAGE)
+        self._real.write(data)
+        self._real.flush()
+        return len(data)
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._real.__exit__(*exc_info)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class WriteFailureCleanupTestCase(unittest.TestCase):
+    """export_csv 新建目标后写入失败的清理回归测试。
+
+    两个用例分别覆盖：目标已创建但表头尚未写成、表头已写入而数据
+    尚未写完。故障统一为带固定消息的 OSError；每个用例核对失败前后
+    的文件状态、错误文本、半成品清理、目录内其他文件不受影响，并在
+    恢复正常条件后用同一源库、同一查询、同一输出路径重试成功导出。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "sample.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，tearDown 中逐一核对
+        self._baseline = self._snapshot_db()
+
+    def tearDown(self):
+        # 每个用例（无论成功或失败）结束后，重新只读打开源库，
+        # 核对两表结构及全部数据与准备完成时完全一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE people ("
+                "id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE notes ("
+                "person_id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                [(1, "小明"), (2, "小红")],
+            )
+            # 两人的备注分别为 NULL 与含逗号、双引号的中文
+            conn.executemany(
+                "INSERT INTO notes (person_id, note) VALUES (?, ?)",
+                [(1, None), (2, NOTE_VALUE)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        """以只读方式重新读取源库的表结构与两表全部数据。"""
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            people = conn.execute(
+                "SELECT id, name FROM people ORDER BY id"
+            ).fetchall()
+            notes = conn.execute(
+                "SELECT person_id, note FROM notes ORDER BY person_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "people": people, "notes": notes}
+
+    @staticmethod
+    def _read_csv(path):
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        return text, list(csv.reader(io.StringIO(text)))
+
+    def _assert_write_failure_then_retry(self, out_name, fail_at,
+                                         expected_bytes_during):
+        """在 fail_at 指定的写入时点注入故障，核对报错与清理后重试成功。"""
+        out = os.path.join(self.tmpdir, out_name)
+        # 目录内预置的其他文件：故障与清理都不得触及
+        sibling = os.path.join(self.tmpdir, "预置 " + out_name + ".txt")
+        sibling_bytes = ("预置文件，不得变化：%s\n" % out_name).encode("utf-8")
+        with open(sibling, "wb") as f:
+            f.write(sibling_bytes)
+
+        # 失败前：输出父目录已存在，目标起初不存在
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(out))
+
+        observed = {}
+
+        def on_fail():
+            # 故障发生瞬间：目标已被本调用创建，记录当时真实落盘内容
+            observed["exists"] = os.path.exists(out)
+            with open(out, "rb") as f:
+                observed["bytes"] = f.read()
+
+        real_open = open
+
+        def flaky_open(path, mode="r", *args, **kwargs):
+            f = real_open(path, mode, *args, **kwargs)
+            if os.path.abspath(path) == os.path.abspath(out) and "x" in mode:
+                return _FlakyFile(f, fail_at, on_fail)
+            return f
+
+        with mock.patch.object(report, "open", create=True, new=flaky_open):
+            with self.assertRaises(ValueError) as ctx:
+                report.export_csv(self.db_path, JOIN_SQL, out)
+
+        # 调用结果为 ValueError：错误文本包含原因前缀、目标路径与原始故障消息
+        message = str(ctx.exception)
+        self.assertIn("无法写入输出文件", message)
+        self.assertIn(out, message)
+        self.assertIn(WRITE_FAIL_MESSAGE, message)
+
+        # 故障发生瞬间的文件状态与预期写入时点一致
+        self.assertTrue(observed["exists"])
+        self.assertEqual(observed["bytes"], expected_bytes_during)
+
+        # 调用结束后半成品已清除；目录保持可写，可正常新建并删除文件
+        self.assertFalse(os.path.exists(out))
+        probe = os.path.join(self.tmpdir, "probe.tmp")
+        with open(probe, "wb") as f:
+            f.write(b"probe")
+        os.remove(probe)
+
+        # 目录内其他预置文件的字节保持不变
+        with open(sibling, "rb") as f:
+            self.assertEqual(f.read(), sibling_bytes)
+
+        # 恢复正常写入条件后，同一源库、同一查询、同一输出路径再次导出：
+        # 失败未留下阻碍后续导出的目标文件
+        count = report.export_csv(self.db_path, JOIN_SQL, out)
+        self.assertEqual(count, 2)
+        _, rows = self._read_csv(out)
+        # CSV 保留查询列顺序；NULL 仍为空字段；中文、逗号与引号完整读回
+        self.assertEqual(rows[0], ["姓名", "备注"])
+        self.assertEqual(rows[1], ["小明", ""])
+        self.assertEqual(rows[2], ["小红", NOTE_VALUE])
+        self.assertEqual(len(rows), 3)
+
+    def test_failure_before_header_removes_partial_and_retry_exports(self):
+        # 第一次 write（表头）即失败：目标已创建但表头尚未写成
+        self._assert_write_failure_then_retry(
+            "fail_before_header.csv", fail_at=1, expected_bytes_during=b""
+        )
+
+    def test_failure_after_header_removes_partial_and_retry_exports(self):
+        # 第二次 write（首行数据）失败：表头已写入而数据尚未写完
+        self._assert_write_failure_then_retry(
+            "fail_after_header.csv",
+            fail_at=2,
+            expected_bytes_during=HEADER_LINE_BYTES,
+        )
 
 
 if __name__ == "__main__":
