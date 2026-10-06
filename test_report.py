@@ -29,6 +29,12 @@ JOIN_SQL = (
 # 同时包含中文、逗号与双引号，用于验证 CSV 字段引用
 NOTE_VALUE = '中文,含"引号"'
 
+# 单条 SELECT 输入边界的可重复样例：字符串内含分号与注释标记，
+# 列名也含分号；这些分号不得被当作语句分隔，引号内的注释标记不得被删去
+SAMPLE_SQL = "SELECT '中文;--/*备注*/' AS \"列;名\""
+SAMPLE_HEADER = "列;名"
+SAMPLE_VALUE = "中文;--/*备注*/"
+
 
 class ReportTestCase(unittest.TestCase):
     """直接调用 export_csv 的行为测试。"""
@@ -158,6 +164,102 @@ class ReportTestCase(unittest.TestCase):
         with open(out, "rb") as f:
             self.assertEqual(f.read(), original_bytes)
 
+    # -- 单条 SELECT 输入边界：允许的形式 -------------------------------
+
+    def _assert_sample_csv(self, path):
+        """核对样例导出：恰好表头一行加数据一行，均为一列且内容完整。"""
+        text, rows = self._read_csv(path)
+        self.assertEqual(rows, [[SAMPLE_HEADER], [SAMPLE_VALUE]])
+        # 每行恰好一列：字符串与列名中的分号未被误判为多条语句
+        self.assertTrue(all(len(row) == 1 for row in rows))
+        # 原文层面完整保留中文与注释标记字符
+        self.assertIn(SAMPLE_VALUE, text)
+
+    def test_leading_trailing_whitespace_accepted(self):
+        out = os.path.join(self.tmpdir, "ws.csv")
+        count = report.export_csv(self.db_path, " \t\n  SELECT 1 AS 值  \n\t ", out)
+
+        self.assertEqual(count, 1)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [["值"], ["1"]])
+
+    def test_select_keyword_case_variations_accepted(self):
+        for i, keyword in enumerate(["select", "SELECT", "SeLeCt"]):
+            with self.subTest(keyword=keyword):
+                out = os.path.join(self.tmpdir, "case_%d.csv" % i)
+                count = report.export_csv(
+                    self.db_path, "%s 1 AS 值" % keyword, out
+                )
+                self.assertEqual(count, 1)
+                _, rows = self._read_csv(out)
+                self.assertEqual(rows, [["值"], ["1"]])
+
+    def test_single_trailing_semicolon_accepted(self):
+        out = os.path.join(self.tmpdir, "semicolon.csv")
+        count = report.export_csv(self.db_path, SAMPLE_SQL + ";", out)
+
+        self.assertEqual(count, 1)
+        self._assert_sample_csv(out)
+
+    def test_comments_with_semicolons_around_statement_accepted(self):
+        # 语句前后的行注释与块注释都含分号，不得被当作语句分隔
+        sql = (
+            "-- 前置行注释;含分号;--/*\n"
+            "/* 前置块注释;含;分号 */\n"
+            + SAMPLE_SQL + ";\n"
+            "/* 后置块注释;含;分号 */\n"
+            "-- 后置行注释;含分号"
+        )
+        out = os.path.join(self.tmpdir, "comments.csv")
+        count = report.export_csv(self.db_path, sql, out)
+
+        self.assertEqual(count, 1)
+        self._assert_sample_csv(out)
+
+    def test_block_comment_between_keyword_and_expression_acts_as_space(self):
+        # SELECT 与表达式之间的块注释与普通空白分隔效果一致
+        sql = "SELECT/*分隔*/'中文;--/*备注*/' AS \"列;名\""
+        out = os.path.join(self.tmpdir, "block_as_space.csv")
+        count = report.export_csv(self.db_path, sql, out)
+
+        self.assertEqual(count, 1)
+        self._assert_sample_csv(out)
+
+    # -- 单条 SELECT 输入边界：拒绝的形式 -------------------------------
+
+    def test_block_comment_cannot_join_keyword_fragments(self):
+        # 去除注释后不得把 SE 与 LECT 拼成合法关键词
+        out = os.path.join(self.tmpdir, "joined_keyword.csv")
+        with self.assertRaises(ValueError):
+            report.export_csv(self.db_path, "SE/*分隔*/LECT 1", out)
+        self.assertFalse(os.path.exists(out))
+
+    def test_rejected_inputs_raise_valueerror_and_create_no_file(self):
+        cases = {
+            "empty_string": "",
+            "blank_whitespace": " \t\n ",
+            "comment_only": "-- 只有行注释;含分号\n/* 块注释;含分号 */",
+            "leading_semicolon": ";SELECT 1",
+            "double_trailing_semicolon": "SELECT 1;;",
+            "two_selects": "SELECT 1; SELECT 2",
+            "select_then_update": "SELECT 1; UPDATE people SET name='篡改' WHERE id=1",
+            "with_cte": "WITH x AS (SELECT 1) SELECT * FROM x",
+            "pragma": "PRAGMA table_info(people)",
+            "explain": "EXPLAIN SELECT 1",
+            "update_only": "UPDATE people SET name='篡改' WHERE id=1",
+        }
+        for name, sql in cases.items():
+            with self.subTest(name=name):
+                # 每个被拒绝的输入使用独立输出路径
+                out = os.path.join(self.tmpdir, "reject_%s.csv" % name)
+                with self.assertRaises(ValueError):
+                    report.export_csv(self.db_path, sql, out)
+                # 拒绝路径不创建目标文件
+                self.assertFalse(os.path.exists(out))
+
+        # 重新只读打开源库：两表结构与全部数据仍与准备完成时一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+
     # -- 命令行入口 ------------------------------------------------------
 
     def _run_cli(self, sql, output):
@@ -202,6 +304,28 @@ class ReportTestCase(unittest.TestCase):
         self.assertIn("已存在", proc.stderr)
         with open(out, "rb") as f:
             self.assertEqual(f.read(), original_bytes)
+
+    def test_cli_single_select_with_comments_exits_zero(self):
+        out = os.path.join(self.tmpdir, "cli_sample.csv")
+        sql = "-- 前置注释;含分号\n" + SAMPLE_SQL + ";"
+        proc = self._run_cli(sql, out)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 标准输出报告导出一行
+        self.assertIn("1", proc.stdout)
+        self.assertIn("行", proc.stdout)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [[SAMPLE_HEADER], [SAMPLE_VALUE]])
+
+    def test_cli_multi_statement_rejected_with_exit_code_one(self):
+        out = os.path.join(self.tmpdir, "cli_multi.csv")
+        proc = self._run_cli("SELECT 1; SELECT 2", out)
+
+        self.assertEqual(proc.returncode, 1)
+        # 原因写到标准错误，标准输出不出现成功提示
+        self.assertIn("错误", proc.stderr)
+        self.assertNotIn("已导出", proc.stdout)
+        self.assertFalse(os.path.exists(out))
 
 
 if __name__ == "__main__":
