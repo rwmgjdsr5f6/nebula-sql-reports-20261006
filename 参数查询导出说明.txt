@@ -1,0 +1,344 @@
+参数查询导出说明：从 query.sql 的 :who 输入到 CSV 产物
+======================================================
+
+- 编写日期：2026-10-07
+- 适用源码：当前目录下的 report.py、query.sql、test_report.py（工作区唯一提交 e2d368a）
+- 文档性质：
+  1. 本文全部行为结论按当前 report.py 源码静态推导，括注的“源码位置”均指向
+     当前 report.py 的行号；query.sql 引述指向当前 query.sql 的行号。
+  2. 凡写“现有测试断言”之处，指 test_report.py 中已经写出的断言（给出
+     行号区间），它们是依据而非实测记录；本文未运行 python -m unittest，
+     也未手工执行下面任何一条示例命令。示例的实际输出为“按源码推导的
+     预期”，不是实测结果。
+  3. 本次交付仅新增本文档；产品代码、测试、README.md 与已有《源码核对
+     说明.md》均不修改，query.sql 内容、样例库结构与数据也保持现状。
+
+
+一、样例库与 query.sql
+----------------------
+
+本文样例沿用 test_report.py 各测试类在临时目录中准备的同一组合成库
+（建表与插数见 test_report.py:57-79，参数与标记相关用例在 949-968、
+1303-1316 重复了同一 people/notes 准备逻辑）：
+
+    people(id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+    notes(person_id INTEGER PRIMARY KEY, note TEXT)
+
+两条关联记录（test_report.py:68-76）：
+
+    people: (1, '小明')、(2, '小红')
+    notes:  (1, NULL)、(2, '中文,含"引号"')   -- 常量 NOTE_VALUE 见 test_report.py:31
+
+即按 p.id = n.person_id 关联后：小明的备注是 SQL NULL，小红的备注是同时
+含中文、逗号与双引号的文本。注意仓库本身不随附 sample.sqlite（.gitignore
+忽略 *.sqlite），下例假设你已按上述结构自行准备好该文件。
+
+当前 query.sql 全文 4 行（query.sql:1-4），结尾分号后有一个换行：
+
+    第 1 行  SELECT p.name AS 姓名, n.note AS 备注
+    第 2 行  FROM people p JOIN notes n ON p.id = n.person_id
+    第 3 行  WHERE p.name = :who
+    第 4 行  ORDER BY p.id;
+
+其中 :who（query.sql:3）是唯一的命名参数占位符。首尾空白与单个结尾分号
+属于允许形态（split_statements 切分后统一 strip，report.py:108-136；
+单尾分号判定 report.py:187-188；文件形态的对应断言 test_report.py:
+603-617、1171-1187 中查询文件带 ";\n"）。
+
+
+二、从输入 who 到生成 CSV：实际先后顺序
+----------------------------------------
+
+使用 --sql-file 时，main（report.py:487-511）与 export_csv
+（report.py:360-423）严格按下列顺序执行，任一步抛异常，其后步骤都不执行：
+
+  顺序  步骤                                              源码位置
+  ----  ------------------------------------------------  ----------------
+   1    命令行解析：--db/--output 必填；--sql 与           report.py:457-484
+        --sql-file 必须恰好选一个（481-482）；--param
+        在第一个等号处拆成名称/值，名称合法性与同名
+        重复都在此拒绝（parse_param_options，434-454）。
+        此步发生在读查询文件之前。
+   2    读取查询文件（仅 --sql-file）：按二进制读入后     read_sql_file
+        以 utf-8-sig 解码（仅剥除开头恰一个 BOM）；       report.py:322-341
+        文件不存在、是目录、不可读、非 UTF-8 均抛
+        ValueError。文件只被读取，绝不改写；此步失败
+        时不接触源库与输出目标（main 先读文件，
+        report.py:490-495）。
+   3    进入 export_csv，先核对 null_text 必须是字符串     report.py:373-376
+   4    核对 params：None 放行；否则必须是 str->str 字典， report.py:377、
+        键名合法、值必须为字符串                          233-251
+   5    SQL 白名单校验：剥注释、按引号外分号切分、         report.py:378、
+        首关键字必须为 SELECT，仅允许一条语句加           175-210
+        至多一个尾分号
+   6    参数核对：扫描占位符（字符串与注释中的 :who        report.py:379、
+        不算）；? 与 ?N 拒绝；查询引用而未提供的           254-319
+        参数拒绝；未被引用的合法参数忽略。遗漏 who
+        就在这一步失败（bind_params，298-319）
+   7    输出目录必须存在；输出目标必须不存在（预查）       report.py:381-385
+   8    以只读 URI（file:...?mode=ro）打开源库，并查       report.py:387、
+        sqlite_master 强制解析文件头；库缺失不会创建       344-357
+   9    执行查询：有绑定字典时 cursor.execute(语句, 绑定)， report.py:389-400
+        无占位符时才 execute(语句)；执行期错误包装为
+        ValueError；再取 cursor.description 的列名与
+        全部数据行
+  10    关闭数据库连接（finally，异常时也关闭）            report.py:401-402
+  11    以独占新建模式 "x" 打开目标，UTF-8、newline=""      report.py:405-421
+        写 CSV：无条件先写一行表头，再逐行写数据；
+        数据单元格为 None（SQL NULL）时写 null_text，
+        其余值原样写；竞态下目标已存在由 FileExistsError
+        拒绝，其他写入错误只清理本调用刚建的半成品
+  12    export_csv 返回数据行数 len(rows)（不含表头）       report.py:423
+  13    main 打印一行成功信息并 return 0；任何              report.py:504-511
+        ValueError 交 die：标准错误输出“错误: …”，
+        退出码 1，不打印成功信息（die，report.py:41-44）
+
+函数入口 export_csv(db_path, sql_text, output_path, params=None,
+null_text="")（report.py:360）接收的是 SQL 文本而非文件路径；要用函数
+入口跑 query.sql，需先以 read_sql_file("query.sql")（report.py:322-341）
+取得文本再传入——main 在 report.py:493 正是这样做的。
+
+相同查询走函数入口时，params 与 null_text 的行为与命令行一一对应：
+--param who=小明 等价于 params={"who": "小明"}；--null-text 未填写
+等价于 null_text="未填写"。省略 params（或传 None）的“原有行为”只对
+不含占位符的查询保持：bind_params 返回 None（report.py:310-311），
+调用方按无参方式 execute（report.py:391-392）；对含 :who 的 query.sql
+省略 params 属于缺少参数（见第六节）。省略 null_text 时默认值为 ""
+（report.py:360、476），SQL NULL 写为空字段。现有断言：params=None
+与三参调用产物字节一致（test_report.py:1031-1041）；省略标记与显式
+空字符串标记产物字节一致（test_report.py:1364-1384）。
+
+
+三、完整成功示例（按源码推导的预期，非实测）
+--------------------------------------------
+
+命令（在含 sample.sqlite 与 query.sql 的目录执行）：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --param who=小明 --null-text 未填写 --output out.csv
+
+等价的函数调用（SQL 文本来自 read_sql_file）：
+
+    import report
+    sql_text = report.read_sql_file("query.sql")
+    count = report.export_csv(
+        "sample.sqlite", sql_text, "out.csv",
+        params={"who": "小明"}, null_text="未填写",
+    )
+    # count == 1
+
+推导依据与预期：
+
+1. 执行：query.sql 通过单条 SELECT 校验（report.py:175-210）；:who 由
+   params 提供，核对通过（report.py:313-319），值经绑定字典交给
+   cursor.execute(statement, bound)（report.py:393-394），WHERE
+   p.name = '小明' 只命中 id=1 一行。
+2. 导出：该行备注为 SQL NULL（Python 端为 None），写出时替换为标记
+   “未填写”（report.py:409-412）；小红一行被 WHERE 过滤，不进入结果。
+3. CSV 逻辑内容：用 csv.reader 读取 out.csv（UTF-8、newline=""）应恰为
+
+       [["姓名", "备注"], ["小明", "未填写"]]
+
+   表头来自 cursor.description（report.py:399、408）。物理文件按 csv
+   默认 excel 方言为 UTF-8、行尾 \r\n，两行均无需引号引用，形如
+   “姓名,备注\r\n小明,未填写\r\n”（行尾与引用规则的同类字节断言见
+   test_report.py:732、1404-1408）。
+4. 函数返回值：1（数据行数，不含表头；report.py:423）。
+5. 命令行退出码：0（main return 0，report.py:510-511、515）。
+6. 标准输出恰为一行（report.py:510 的格式串原样展开）：
+
+       已导出 1 行数据：out.csv
+
+7. 标准错误为空（成功路径不向 stderr 写任何内容；同类命令行用例直接
+   断言 proc.stderr == ""，test_report.py:1498、1514、1533）。
+
+现有测试对这条精确组合命令没有逐字用例；下列断言分别覆盖其每个组成
+部分，合起来可与本节预期核对：
+- 参数过滤为一行（小红）：函数断言 test_report.py:1011-1019；
+  命令行 --sql-file + --param：1171-1187；命令行 --sql + who=小明
+  （默认空标记，故备注读到 ""）：1189-1194。
+- --null-text 只替换 SQL NULL：函数断言 1388-1412（使用独立的
+  records 样例表）；命令行“查询文件 + 命名参数只选中 NULL 行 +
+  标记 未填写”组合：1525-1540，其 csv.reader 结果为
+  [["编号", "备注"], ["1", "未填写"]]，与本例同构。
+- 成功信息含“已导出 N 行数据”及输出路径：1500-1501、1534-1535。
+- --sql-file 与 --sql 产物字节一致、查询文件字节不变：573-601。
+
+
+四、改用未命中的姓名：只有表头，数据行数为 0
+--------------------------------------------
+
+把参数换成任何不存在的姓名，例如：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --param who=不存在 --null-text 未填写 --output miss.csv
+
+按源码推导：WHERE 不命中，fetchall 得到空列表（report.py:400）；表头
+在数据循环之前无条件写入（report.py:408），故 miss.csv 经 csv.reader
+读取恰为 [["姓名", "备注"]]；export_csv 返回 0（report.py:423），
+命令行退出码 0，标准输出为“已导出 0 行数据：miss.csv”，标准错误为空。
+现有断言：零行结果仅表头、返回 0（函数 test_report.py:128-140；
+--sql-file 命令行 619-631；参数值匹配不到任何人 1021-1029、1196-1202）。
+
+
+五、参数字符串 "null" 仍是文本；导出标记只替换结果中的 SQL NULL
+----------------------------------------------------------------
+
+这是两条互不影响的规则：
+
+1. 参数值一律按文本绑定，不做类型转换。--param who=null 绑定的是文本
+   'null'，用于比较 p.name = 'null'，既不匹配任何人，也不会变成 SQL
+   NULL；数字、布尔词同理。源码：validate_params 的说明与实现
+   （report.py:233-251，字符串值“不做任何类型转换”），绑定只走
+   cursor.execute 的参数机制、绝不拼入 SQL 文本（report.py:393-394）。
+   现有断言：typeof(:a)/typeof(@b)/typeof($c) 对 "123"、"null"、
+   "true" 均读到 text（test_report.py:1052-1063）；注入形态文本
+   "小红' OR 1=1 --" 匹配零行（1021-1029、1196-1202）。
+2. --null-text / null_text 只在“写结果”环节替换数据单元格中的 SQL
+   NULL（Python 值为 None）：转换表达式是
+   null_text if value is None else value（report.py:411）。因此：
+   - 源数据中的空字符串 '' 不是 None，仍写为空字段，不会被标记替换；
+   - 恰好与标记同形的普通文本（如本就存着“未填写”）按普通文本写入，
+     不做额外转义，CSV 无法据字节区分它与被替换的 NULL；
+   - 标记不影响列名、列顺序、行顺序、非空值与数据行数。
+   现有断言（独立 records 表：NULL、空字符串、文本“未填写”、普通中文
+   四行）：标记“未填写”时仅第 1 条变化、空字符串仍为空、同形文本原样
+   保留（test_report.py:1388-1412，期望表 1263-1277）；复杂标记
+   （含首尾空格、逗号、引号、换行）经 csv.reader 完整还原（1416-1440）。
+
+回到 people/notes：若不带 --null-text（默认空标记），小明的 NULL 备注
+读回为空字符串（["小明", ""]），该行为有直接断言
+（test_report.py:1189-1194，以及无参数关联导出 108-124）。
+
+
+六、失败示例：遗漏 who
+----------------------
+
+命令（不带任何 --param）：
+
+    python report.py --db sample.sqlite --sql-file query.sql --output out.csv
+
+按源码推导：
+
+1. 查询文件正常读取（顺序 2）；进入 export_csv 后，null_text 为默认
+   ""、params 为 None 均通过（顺序 3-4），SQL 通过单条 SELECT 校验
+   （顺序 5）。
+2. bind_params 扫到命名参数 who（find_placeholders，
+   report.py:254-295），提供方字典中无此名，missing 非空，抛
+   ValueError("缺少查询引用的参数：who")（report.py:313-318）。
+3. 此步在输出目录/目标检查（report.py:381-385）与打开源库
+   （report.py:387）之前：不打开库、不创建 out.csv。
+4. 函数入口：report.export_csv(db, sql_text, "out.csv") 抛 ValueError。
+5. 命令行：main 捕获后交 die（report.py:504-505）——
+   - 退出码：1（report.py:44）；
+   - 标准错误恰为一行：错误: 缺少查询引用的参数：who
+     （“错误: ”前缀 report.py:43；冒号与顿号格式 report.py:318）；
+   - 标准输出为空（成功打印语句 report.py:510 不可达）；
+   - 目标文件 out.csv 不被创建。
+
+现有断言：函数入口对 None、空字典、{"other": "x"} 三种提供方式均拒绝
+且不建文件（test_report.py:1113-1129）；命令行退出码 1、标准错误含
+“错误”与 who、标准输出为空、目标不存在（1231-1238）。标准错误的
+完整逐字文本按源码推导（现有用例为包含性断言）。
+
+
+七、其他拒绝规则与边界（成功与失败均有源码依据）
+------------------------------------------------
+
+1. 函数传入非字符串参数值：params={"who": 1}（或 None、True、1.5）
+   在 validate_params 中抛 ValueError（“参数 'who' 的值必须是字符串，
+   收到 int”等，report.py:247-250），不建文件。现有断言
+   test_report.py:1143-1148；params 不是字典时的拒绝见 241-244、
+   1138-1141。命令行入口取不到非字符串值（argparse 给出的均为 str）。
+2. 函数传入非字符串 null_text：null_text=None、1、True 时，
+   export_csv 的第一步即抛 ValueError（“null_text 必须是字符串，
+   收到 …”，report.py:373-376），早于参数与 SQL 核对，不建文件。
+   现有断言 test_report.py:1460-1470。空字符串是合法标记（见第五节）。
+3. 输出目标已存在：预查 os.path.exists 为真即抛
+   ValueError("输出目标已存在，拒绝覆盖：…")（report.py:384-385），
+   发生在打开源库之前；即便绕过预查，写入端 "x" 独占新建与
+   FileExistsError 分支同样拒绝（report.py:405-406、413-414）。
+   既有文件的原字节保持不变。现有断言：函数入口二进制样本逐字节不变
+   （test_report.py:302-312）；--sql-file 命令行退出码 1、标准错误含
+   “已存在”、标准输出为空、原字节不变（714-726）；null_text 用例
+   1474-1489。
+4. 参数名区分大小写：占位符 :Who 与字典键 "who" 不匹配，按缺少参数
+   拒绝；键名规则为“首字符 ASCII 字母或下划线，后续仅含 ASCII 字母、
+   数字、下划线”（PARAM_NAME_RE 与 validate_param_name，
+   report.py:213-230；核对按字典精确成员判定，report.py:315）。
+   即 --param WHO=小明 或 --param Who=小明 对 query.sql 都会得到
+   “缺少查询引用的参数：who”。现有断言 test_report.py:1101-1109；
+   非法名称（含中文、带前缀 :who 等）拒绝见 1150-1167。
+5. 同名命令行参数重复提供：--param who=小明 --param who=小红 在
+   parse_param_options 中立即拒绝（report.py:451-452），经
+   _Parser.error 走 die（report.py:429-431、41-44）：退出码 1。
+   注意这条路径的标准错误有两部分——_Parser.error 先经 print_usage
+   输出一行用法（report.py:430），再由 die 输出
+   “错误: 参数错误：重复提供同名参数：'who'”（report.py:431、452、
+   43；%r 对 str 带单引号）；标准输出为空。拒绝发生在 parse_args 内
+   （report.py:483），早于 main 读取查询文件（report.py:493），故不
+   读文件、不开库、不创建目标。对比第六节：遗漏 who 是 export_csv
+   抛出的 ValueError，直接由 die 处理，stderr 没有用法行。现有断言
+   （退出码 1、stderr 含“错误”、stdout 为空、无目标文件；包含性断言）
+   test_report.py:1215-1229。
+6. 等号后的文本原样保留，且不拼入 SQL：--param 只在第一个等号处
+   partition（report.py:444），其后的等号、空格、中文、引号、分号
+   全部成为值的一部分（空字符串也是有效值）；值只作为绑定数据传给
+   cursor.execute（report.py:393-394），SQL 文本本身不含参数值。
+   现有断言：值 a=b 中文 "引号";-- 原样读回（test_report.py:
+   1204-1213）；缺少等号、非法名称在命令行以退出码 1 拒绝（1215-1229）；
+   注入形态文本匹配零行（1021-1029、1196-1202）；空字符串值有效但
+   不匹配任何姓名（1043-1050）。
+
+
+八、源码位置与现有测试断言对照（速查）
+--------------------------------------
+
+行为                                      源码位置              现有测试断言
+----------------------------------------  --------------------  ----------------
+查询文件 UTF-8/单 BOM 读取、只读不改写     report.py:322-341     573-601、603-617、
+                                                                  668-691
+单条 SELECT 白名单（含尾分号、拒多语句）   report.py:175-210     257-286、650-664
+占位符扫描（跳过字符串/注释；三种前缀）    report.py:254-295     1065-1092
+位置占位符 ?/?N 拒绝                        report.py:306-309     1131-1136、1240-1248
+缺少引用参数拒绝                           report.py:313-318     1125-1129、1231-1238
+未引用合法参数忽略                         report.py:312-319     1094-1099
+params 类型/键名/值字符串校验              report.py:233-251     1138-1167
+参数名大小写敏感                           report.py:215、315    1101-1109
+--param 首个等号拆分、值原样、同名重复拒绝 report.py:434-454     1204-1229
+值按文本绑定、不拼入 SQL                   report.py:391-394     1021-1029、1052-1063、
+                                                                  1196-1202
+只读打开源库、缺失不创建                   report.py:344-357     464-486
+null_text 必须为字符串                     report.py:373-376     1460-1470
+NULL 替换为标记、空字符串不替换            report.py:409-412     1364-1412
+零行结果仅表头、返回 0                     report.py:408、423    128-140、619-631、
+                                                                  1444-1456
+目标已存在拒绝且原字节保留                 report.py:384-385、   302-312、345-357、
+                                          413-414               714-726、1474-1489
+成功输出一行“已导出 N 行数据：路径”       report.py:510         333-343、1179-1182、
+                                                                  1493-1505、1525-1535
+失败：退出码 1、stderr“错误: …”、         report.py:41-44、     345-357、376-387、
+      stdout 为空、不建目标                 504-509               1215-1248、635-691
+
+表中“现有测试断言”列为 test_report.py 行号，仅表示测试已写出对应
+断言；本文未运行它们，第三、四、六、七节中的逐字命令行输出均属按
+当前源码推导的预期。
+
+
+九、范围与未改动项
+------------------
+
+1. 本文只覆盖“读取 query.sql → 绑定命名参数 who → 只读执行一条
+   SELECT → 写带表头 CSV → 返回行数”这一条路径，以及同一查询经
+   export_csv 的 params、null_text 对应行为。
+2. SQL 支持范围维持现状：仅接受单条普通 SELECT（允许首尾空白与一个
+   结尾分号、引号外注释）；WITH/CTE、PRAGMA、EXPLAIN、写入语句、
+   多语句与位置占位符一律拒绝（report.py:175-210、298-319），本文
+   不扩展该范围。
+3. 未提供参数（params=None）对无占位符查询按无参执行的已有行为、
+   null_text 默认空字符串（NULL → 空字段）的已有行为保持不变。
+4. query.sql 文件内容、样例库（people/notes）结构与两条记录均保持
+   现状；本次不新增任何查询管理（保存、列表、复用等）或 HTML 等其他
+   报告格式，report.py、test_report.py、README.md、《源码核对说明.md》
+   均不修改，仓库中既有的 result.csv、result2.csv 仍不被程序或测试
+   引用，本文示例不以其为依据。
