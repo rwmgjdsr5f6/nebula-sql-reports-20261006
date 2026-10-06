@@ -50,7 +50,11 @@ def _skip_quoted(sql, i):
 
 
 def strip_sql_comments(sql):
-    """去除 SQL 中的 -- 行注释与 C 风格块注释，引号内的注释文本保持原样。"""
+    """去除 SQL 中的 -- 行注释与 C 风格块注释，引号内的注释文本保持原样。
+
+    块注释统一替换为一个空格（而非直接删除），使其与普通空白分隔语义
+    一致：SE/*x*/LECT 不会被拼成 SELECT，列别名等相邻词语也不会被改写。
+    """
     out = []
     i = 0
     n = len(sql)
@@ -69,7 +73,10 @@ def strip_sql_comments(sql):
         if sql[i] == "/" and i + 1 < n and sql[i + 1] == "*":
             j = sql.find("*/", i + 2)
             if j == -1:
+                # 未闭合的块注释：替换为空格后截断，交由 SQLite 判语法
+                out.append(" ")
                 break
+            out.append(" ")  # 已闭合块注释等价于一个空白分隔符
             i = j + 2
             continue
         out.append(sql[i])
