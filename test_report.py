@@ -918,5 +918,335 @@ class WriteFailureCleanupTestCase(unittest.TestCase):
         )
 
 
+# 带命名参数的关联查询：与验收用 query.sql 同形
+JOIN_WHO_SQL = (
+    "SELECT p.name AS 姓名, n.note AS 备注 "
+    "FROM people p JOIN notes n ON p.id=n.person_id "
+    "WHERE p.name = :who ORDER BY p.id"
+)
+# 注入形态的参数值：作为文本绑定时不应匹配任何记录
+INJECTION_VALUE = "小红' OR 1=1 --"
+
+
+class ParamTestCase(unittest.TestCase):
+    """命名文本参数（--param / export_csv 的 params）的回归测试。
+
+    每个用例独立准备临时目录与 people/notes 样例库；tearDown 核对源库
+    结构与数据相对准备基线零变化。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "sample.sqlite")
+        self._prepare_db()
+        self._baseline = self._snapshot_db()
+
+    def tearDown(self):
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE people ("
+                "id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE notes ("
+                "person_id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                [(1, "小明"), (2, "小红")],
+            )
+            conn.executemany(
+                "INSERT INTO notes (person_id, note) VALUES (?, ?)",
+                [(1, None), (2, NOTE_VALUE)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            people = conn.execute(
+                "SELECT id, name FROM people ORDER BY id"
+            ).fetchall()
+            notes = conn.execute(
+                "SELECT person_id, note FROM notes ORDER BY person_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "people": people, "notes": notes}
+
+    @staticmethod
+    def _read_csv(path):
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        return text, list(csv.reader(io.StringIO(text)))
+
+    def _run_cli(self, output, sql=None, sql_file=None, params=()):
+        cmd = [sys.executable, REPORT_PY, "--db", self.db_path]
+        if sql is not None:
+            cmd += ["--sql", sql]
+        if sql_file is not None:
+            cmd += ["--sql-file", sql_file]
+        for item in params:
+            cmd += ["--param", item]
+        cmd += ["--output", output]
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    # -- 参数筛选与注入安全 ------------------------------------------------
+
+    def test_param_filters_to_one_row(self):
+        out = os.path.join(self.tmpdir, "who.csv")
+        count = report.export_csv(
+            self.db_path, JOIN_WHO_SQL, out, params={"who": "小红"}
+        )
+        self.assertEqual(count, 1)
+        _, rows = self._read_csv(out)
+        # 表头与列顺序不变，只导出小红及其备注
+        self.assertEqual(rows, [["姓名", "备注"], ["小红", NOTE_VALUE]])
+
+    def test_param_injection_text_matches_nothing(self):
+        out = os.path.join(self.tmpdir, "injected.csv")
+        count = report.export_csv(
+            self.db_path, JOIN_WHO_SQL, out, params={"who": INJECTION_VALUE}
+        )
+        # 值只作为数据参与比较：注入形态文本匹配不到任何记录
+        self.assertEqual(count, 0)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [["姓名", "备注"]])
+
+    def test_params_none_matches_plain_three_arg_call(self):
+        out_plain = os.path.join(self.tmpdir, "plain.csv")
+        out_none = os.path.join(self.tmpdir, "none.csv")
+        self.assertEqual(report.export_csv(self.db_path, JOIN_SQL, out_plain), 2)
+        self.assertEqual(
+            report.export_csv(self.db_path, JOIN_SQL, out_none, params=None), 2
+        )
+        with open(out_plain, "rb") as f:
+            plain_bytes = f.read()
+        with open(out_none, "rb") as f:
+            self.assertEqual(f.read(), plain_bytes)
+
+    def test_empty_string_is_valid_value(self):
+        out = os.path.join(self.tmpdir, "empty_value.csv")
+        count = report.export_csv(
+            self.db_path, JOIN_WHO_SQL, out, params={"who": ""}
+        )
+        self.assertEqual(count, 0)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [["姓名", "备注"]])
+
+    def test_values_are_not_type_converted(self):
+        out = os.path.join(self.tmpdir, "typeof.csv")
+        count = report.export_csv(
+            self.db_path,
+            "SELECT typeof(:a) AS ta, typeof(@b) AS tb, typeof($c) AS tc",
+            out,
+            params={"a": "123", "b": "null", "c": "true"},
+        )
+        self.assertEqual(count, 1)
+        _, rows = self._read_csv(out)
+        # 数字、null、布尔词一律按文本绑定
+        self.assertEqual(rows, [["ta", "tb", "tc"], ["text", "text", "text"]])
+
+    def test_three_prefix_styles_share_one_value(self):
+        out = os.path.join(self.tmpdir, "prefixes.csv")
+        count = report.export_csv(
+            self.db_path,
+            "SELECT :who AS a, @who AS b, $who AS c, :who AS d",
+            out,
+            params={"who": "小红"},
+        )
+        self.assertEqual(count, 1)
+        _, rows = self._read_csv(out)
+        # 重复引用同名参数使用同一值
+        self.assertEqual(rows, [["a", "b", "c", "d"], ["小红"] * 4])
+
+    def test_placeholder_like_text_in_string_and_comment_ignored(self):
+        out = os.path.join(self.tmpdir, "literal.csv")
+        sql = (
+            "SELECT ':who' AS 冒号, '@who' AS 圈, '$who' AS 刀, '?' AS 问 "
+            "-- 行注释里的 :who @who $who ? ?1 不算参数\n"
+            "/* 块注释里的 :who ? 也不算 */"
+        )
+        # 未提供任何参数也不应报缺少参数
+        count = report.export_csv(self.db_path, sql, out)
+        self.assertEqual(count, 1)
+        _, rows = self._read_csv(out)
+        self.assertEqual(
+            rows,
+            [["冒号", "圈", "刀", "问"], [":who", "@who", "$who", "?"]],
+        )
+
+    def test_unreferenced_legal_param_ignored(self):
+        out = os.path.join(self.tmpdir, "extra.csv")
+        count = report.export_csv(
+            self.db_path, JOIN_SQL, out, params={"unused": "值", "who": "小红"}
+        )
+        self.assertEqual(count, 2)
+
+    def test_param_names_are_case_sensitive(self):
+        out = os.path.join(self.tmpdir, "case.csv")
+        sql = "SELECT :Who AS v"
+        # Who 与 who 是两个不同参数
+        with self.assertRaises(ValueError):
+            report.export_csv(self.db_path, sql, out, params={"who": "x"})
+        self.assertFalse(os.path.exists(out))
+        count = report.export_csv(self.db_path, sql, out, params={"Who": "x"})
+        self.assertEqual(count, 1)
+
+    # -- 函数入口拒绝 ------------------------------------------------------
+
+    def _assert_param_rejected(self, sql, params, reason_part=None):
+        seq = getattr(self, "_reject_seq", 0) + 1
+        self._reject_seq = seq
+        out = os.path.join(self.tmpdir, "param_rejected_%02d.csv" % seq)
+        self.assertFalse(os.path.exists(out))
+        with self.assertRaises(ValueError) as ctx:
+            report.export_csv(self.db_path, sql, out, params=params)
+        if reason_part is not None:
+            self.assertIn(reason_part, str(ctx.exception))
+        # 拒绝路径绝不产生目标 CSV
+        self.assertFalse(os.path.exists(out))
+
+    def test_missing_required_param_rejected(self):
+        # 完全不提供、提供空字典、提供其他名字，均为缺少必要参数
+        for params in (None, {}, {"other": "x"}):
+            with self.subTest(params=params):
+                self._assert_param_rejected(JOIN_WHO_SQL, params, "who")
+
+    def test_positional_placeholders_rejected(self):
+        self._assert_param_rejected("SELECT ?", None, "位置占位符")
+        self._assert_param_rejected("SELECT ?1", None, "位置占位符")
+        self._assert_param_rejected(
+            "SELECT * FROM people WHERE id = ?2", {"who": "x"}, "位置占位符"
+        )
+
+    def test_non_dict_params_rejected(self):
+        for bad in ("who=小红", ["who", "小红"], 42):
+            with self.subTest(params=bad):
+                self._assert_param_rejected(JOIN_WHO_SQL, bad, "字符串字典")
+
+    def test_non_string_value_rejected(self):
+        for bad_value in (1, None, True, 1.5):
+            with self.subTest(value=bad_value):
+                self._assert_param_rejected(
+                    JOIN_WHO_SQL, {"who": bad_value}, "必须是字符串"
+                )
+
+    def test_invalid_param_names_rejected(self):
+        for bad_name in (
+            "",
+            "1who",
+            "who x",
+            "who-x",
+            "谁",
+            ":who",  # 字典键不带占位符前缀
+            "@who",
+            "$who",
+        ):
+            with self.subTest(name=bad_name):
+                self._assert_param_rejected(
+                    JOIN_WHO_SQL, {bad_name: "小红"}, "非法参数名"
+                )
+
+    def test_non_string_key_rejected(self):
+        self._assert_param_rejected(JOIN_WHO_SQL, {1: "小红"}, "非法参数名")
+
+    # -- 命令行入口 --------------------------------------------------------
+
+    def test_cli_param_with_sql_file_filters_one_row(self):
+        sql_path = os.path.join(self.tmpdir, "查询.sql")
+        with open(sql_path, "w", encoding="utf-8") as f:
+            f.write(JOIN_WHO_SQL + ";\n")
+        out = os.path.join(self.tmpdir, "cli_who.csv")
+
+        proc = self._run_cli(out, sql_file=sql_path, params=["who=小红"])
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("1", proc.stdout)
+        self.assertIn("行", proc.stdout)
+        self.assertIn(out, proc.stdout)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [["姓名", "备注"], ["小红", NOTE_VALUE]])
+        # 查询文件只被读取，内容不变
+        with open(sql_path, "rb") as f:
+            self.assertEqual(f.read(), (JOIN_WHO_SQL + ";\n").encode("utf-8"))
+
+    def test_cli_param_with_inline_sql(self):
+        out = os.path.join(self.tmpdir, "cli_inline.csv")
+        proc = self._run_cli(out, sql=JOIN_WHO_SQL, params=["who=小明"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [["姓名", "备注"], ["小明", ""]])
+
+    def test_cli_injection_value_exports_header_only(self):
+        out = os.path.join(self.tmpdir, "cli_injected.csv")
+        proc = self._run_cli(out, sql=JOIN_WHO_SQL, params=["who=" + INJECTION_VALUE])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("0", proc.stdout)
+        _, rows = self._read_csv(out)
+        self.assertEqual(rows, [["姓名", "备注"]])
+
+    def test_cli_param_value_split_at_first_equals_only(self):
+        out = os.path.join(self.tmpdir, "cli_value.csv")
+        tricky = "a=b 中文 \"引号\";--"
+        proc = self._run_cli(
+            out, sql="SELECT :who AS v", params=["who=" + tricky]
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, rows = self._read_csv(out)
+        # 第一个等号后的全部内容（含等号、空格、中文、引号、分号）原样保留
+        self.assertEqual(rows, [["v"], [tricky]])
+
+    def test_cli_param_errors_exit_one_empty_stdout_no_file(self):
+        cases = [
+            ["who"],               # 缺少等号
+            ["1who=x"],            # 非法名称
+            ["who x=y"],           # 非法名称
+            ["who=a", "who=b"],    # 重复提供同名选项
+        ]
+        for i, params in enumerate(cases):
+            with self.subTest(params=params):
+                out = os.path.join(self.tmpdir, "cli_bad_%d.csv" % i)
+                proc = self._run_cli(out, sql=JOIN_WHO_SQL, params=params)
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("错误", proc.stderr)
+                self.assertEqual(proc.stdout, "")
+                self.assertFalse(os.path.exists(out))
+
+    def test_cli_missing_param_exit_one_empty_stdout_no_file(self):
+        out = os.path.join(self.tmpdir, "cli_missing_param.csv")
+        proc = self._run_cli(out, sql=JOIN_WHO_SQL)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误", proc.stderr)
+        self.assertIn("who", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    def test_cli_positional_placeholder_exit_one_empty_stdout_no_file(self):
+        out = os.path.join(self.tmpdir, "cli_positional.csv")
+        proc = self._run_cli(
+            out, sql="SELECT * FROM people WHERE id = ?", params=["who=1"]
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+
 if __name__ == "__main__":
     unittest.main()

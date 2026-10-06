@@ -4,17 +4,28 @@
 用法:
     python report.py --db DB.sqlite --sql "SELECT ..." --output out.csv
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv
+    python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
+        --param who=小红 --param tag=a=b
 
 --sql 与 --sql-file 必须恰好选择一个；查询文件按 UTF-8 读取（允许开头
 一个 BOM），文件内容适用与 --sql 完全相同的规则。仅接受一条 SELECT
 语句（允许首尾空白与结尾分号）；WITH、PRAGMA、写入语句及多语句输入
 一律拒绝。数据库以只读方式打开，缺失时不会创建；输出目标已存在时拒绝
 写入，绝不覆盖或截断；查询文件只被读取，绝不改写。
+
+--param name=value 可重复提供，为查询中的命名参数（:name、@name、$name）
+提供文本值：在第一个等号处分开名称与值，值的其余等号、空格、中文、
+引号和分号原样保留；空字符串是有效值。参数名区分大小写，首字符须为
+ASCII 字母或下划线，后续仅含 ASCII 字母、数字或下划线。值一律按文本
+绑定（数字、null、布尔词不转换类型），只作为数据参与查询，绝不拼接进
+SQL 文本。字符串与注释中的类似文本不算参数；未被查询引用的合法参数
+忽略；缺少查询引用的参数、或使用 ?、?1 位置占位符，均拒绝。
 """
 
 import argparse
 import csv
 import os
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -192,6 +203,115 @@ def validate_single_select(sql, _depth=0):
     return statement
 
 
+# 参数名：首字符为 ASCII 字母或下划线，后续仅含 ASCII 字母、数字或下划线；
+# 区分大小写；字典键不带 :、@、$ 占位符前缀
+PARAM_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _is_name_char(ch):
+    """参数名字符：ASCII 字母、数字或下划线（非 ASCII 字符一律不算）。"""
+    return ch.isascii() and (ch.isalnum() or ch == "_")
+
+
+def validate_param_name(name):
+    """校验单个参数名，非法时抛 ValueError；合法则原样返回。"""
+    if not isinstance(name, str) or PARAM_NAME_RE.fullmatch(name) is None:
+        raise ValueError(
+            "非法参数名：%r（首字符须为 ASCII 字母或下划线，"
+            "后续仅含 ASCII 字母、数字或下划线）" % (name,)
+        )
+    return name
+
+
+def validate_params(params):
+    """校验参数字典：None 原样返回；否则必须是 str->str 字典且键为合法参数名。
+
+    值一律按文本处理：非字符串值（数字、None、布尔等）拒绝，字符串值
+    （包括 "123"、"null"、"true" 与空字符串）原样保留，不做任何类型转换。
+    """
+    if params is None:
+        return None
+    if not isinstance(params, dict):
+        raise ValueError(
+            "参数必须是 名称->文本 的字符串字典，收到 %s" % type(params).__name__
+        )
+    for name, value in params.items():
+        validate_param_name(name)
+        if not isinstance(value, str):
+            raise ValueError(
+                "参数 %r 的值必须是字符串，收到 %s" % (name, type(value).__name__)
+            )
+    return dict(params)
+
+
+def find_placeholders(statement):
+    """扫描语句中的参数占位符，返回 (命名参数名列表, 是否含位置占位符)。
+
+    字符串字面量、引号标识符与注释中的类似文本不算参数。命名参数支持
+    :name、@name、$name 三种前缀，返回的名字不含前缀、按出现顺序排列
+    （重复引用会重复出现）；? 与 ?N 归为位置占位符。
+    """
+    named = []
+    positional = False
+    i = 0
+    n = len(statement)
+    while i < n:
+        skipped = _skip_quoted(statement, i)
+        if skipped is not None:
+            i = skipped
+            continue
+        ch = statement[i]
+        # 语句文本通常已是 strip_sql_comments 的输出；此处仍跳过注释，
+        # 保证本函数可独立用于任意 SQL 文本
+        if ch == "-" and i + 1 < n and statement[i + 1] == "-":
+            j = statement.find("\n", i + 2)
+            i = n if j == -1 else j
+            continue
+        if ch == "/" and i + 1 < n and statement[i + 1] == "*":
+            j = statement.find("*/", i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        if ch == "?":
+            positional = True
+            i += 1
+            while i < n and statement[i].isdigit():
+                i += 1
+            continue
+        if ch in ":@$" and i + 1 < n and _is_name_char(statement[i + 1]):
+            j = i + 2
+            while j < n and _is_name_char(statement[j]):
+                j += 1
+            named.append(statement[i + 1:j])
+            i = j
+            continue
+        i += 1
+    return named, positional
+
+
+def bind_params(statement, params):
+    """核对语句占位符与参数字典，返回可交给 sqlite3 的绑定字典或 None。
+
+    位置占位符（?、?1）一律拒绝；查询引用而字典未提供的参数拒绝；
+    未被引用的合法参数忽略。返回 None 表示语句没有任何占位符，
+    调用方按无参数方式执行（保持原有行为）。
+    """
+    named, positional = find_placeholders(statement)
+    if positional:
+        raise ValueError(
+            "不支持位置占位符 ? 或 ?N：请改用 :name、@name 或 $name 命名参数"
+        )
+    if not named:
+        return None
+    provided = params or {}
+    missing = []
+    for name in named:
+        if name not in provided and name not in missing:
+            missing.append(name)
+    if missing:
+        raise ValueError("缺少查询引用的参数：%s" % "、".join(missing))
+    return provided
+
+
 def read_sql_file(path):
     """读取查询文件文本：按 UTF-8 解码，允许开头恰一个 BOM；失败抛 ValueError。
 
@@ -230,9 +350,16 @@ def open_readonly(db_path):
     return conn
 
 
-def export_csv(db_path, sql_text, output_path):
-    """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。"""
+def export_csv(db_path, sql_text, output_path, params=None):
+    """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
+
+    params 为可选的 名称->文本 参数字典（键不带占位符前缀），为查询中的
+    :name、@name、$name 命名参数提供值；省略或传入 None 时与不提供参数
+    的原有调用行为完全一致。值只作为绑定数据参与查询，绝不拼进 SQL 文本。
+    """
+    params = validate_params(params)
     statement = validate_single_select(sql_text)
+    bound = bind_params(statement, params)
 
     output_dir = os.path.dirname(os.path.abspath(output_path))
     if not os.path.isdir(output_dir):
@@ -244,7 +371,10 @@ def export_csv(db_path, sql_text, output_path):
     try:
         cursor = conn.cursor()
         try:
-            cursor.execute(statement)
+            if bound is None:
+                cursor.execute(statement)
+            else:
+                cursor.execute(statement, bound)
         except sqlite3.Error as exc:
             raise ValueError("SQL 执行失败：%s" % exc)
         if cursor.description is None:
@@ -282,6 +412,29 @@ class _Parser(argparse.ArgumentParser):
         die("参数错误：%s" % message)
 
 
+def parse_param_options(items, parser):
+    """把 --param name=value 列表解析为参数字典；非法输入经 parser.error 拒绝。
+
+    在第一个等号处分开名称与值：值的其余等号、空格、中文、引号和分号
+    原样保留；空字符串是有效值。同名选项重复提供即拒绝。
+    """
+    if not items:
+        return None
+    params = {}
+    for item in items:
+        name, sep, value = item.partition("=")
+        if not sep:
+            parser.error("--param 需要 name=value 形式（缺少等号）：%r" % item)
+        try:
+            validate_param_name(name)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if name in params:
+            parser.error("重复提供同名参数：%r" % name)
+        params[name] = value
+    return params
+
+
 def parse_args(argv):
     parser = _Parser(
         description="对 SQLite 执行一条只读 SELECT 并导出带列名的 CSV"
@@ -292,10 +445,17 @@ def parse_args(argv):
         "--sql-file", help="包含一条 SELECT 查询的 UTF-8 文件路径（允许一个 BOM）"
     )
     parser.add_argument("--output", required=True, help="输出 CSV 路径（不得已存在）")
+    parser.add_argument(
+        "--param",
+        action="append",
+        metavar="name=value",
+        help="查询命名参数的文本值，可重复；值在第一个等号后原样保留",
+    )
     args = parser.parse_args(argv)
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
         parser.error("--sql 与 --sql-file 必须恰好选择一个")
+    args.params = parse_param_options(args.param, parser)
     return args
 
 
@@ -309,7 +469,7 @@ def main(argv=None):
         except ValueError as exc:
             die(str(exc))
     try:
-        row_count = export_csv(args.db, sql_text, args.output)
+        row_count = export_csv(args.db, sql_text, args.output, params=args.params)
     except ValueError as exc:
         die(str(exc))
     except sqlite3.Error as exc:
