@@ -386,5 +386,103 @@ class ReportTestCase(unittest.TestCase):
         self.assertFalse(os.path.exists(out))
 
 
+# 源库打开失败回归的两个固定输入：
+# 缺失库（从未创建）与普通文本文件（重复 32 次的一句话加换行）
+INVALID_DB_BYTES = b"not a sqlite database\n" * 32
+# SELECT 1 不访问任何业务表；若仍被拒，说明问题出在打开阶段而非查询阶段
+SOURCE_FAILURE_SQL = "SELECT 1 AS 数值"
+OPEN_FAILURE_MESSAGE = "无法以只读方式打开数据库"
+
+
+class SourceOpenFailureTestCase(unittest.TestCase):
+    """源数据库缺失或不是数据库文件时，函数入口与命令行入口各自的回归覆盖。
+
+    四个用例分别核对一种"源库状态 × 入口"组合，且每次调用使用独立的、
+    尚不存在的 CSV 路径并独立核对文件结果，避免前一次失败掩盖后一次
+    可能产生的文件。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        # 父目录已存在；missing.sqlite 从头到尾都不创建
+        self.missing_db = os.path.join(self.tmpdir, "missing.sqlite")
+        self.assertFalse(os.path.exists(self.missing_db))
+        # invalid.sqlite 是内容固定的普通文本文件，不是 SQLite 数据库
+        self.invalid_db = os.path.join(self.tmpdir, "invalid.sqlite")
+        with open(self.invalid_db, "wb") as f:
+            f.write(INVALID_DB_BYTES)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _assert_open_failure_message(self, message, db_path):
+        # 只固定公开含义：只读打开失败且消息带源路径；
+        # 不要求不同 SQLite 版本给出相同的底层英文消息
+        self.assertIn(OPEN_FAILURE_MESSAGE, message)
+        self.assertIn(db_path, message)
+
+    def _expect_function_failure(self, db_path, out):
+        # 前置条件：目标 CSV 尚不存在，排除输出路径错误先于源库错误
+        self.assertFalse(os.path.exists(out))
+        with self.assertRaises(ValueError) as ctx:
+            report.export_csv(db_path, SOURCE_FAILURE_SQL, out)
+        self._assert_open_failure_message(str(ctx.exception), db_path)
+        # 失败后本次调用专属的目标 CSV 仍不存在
+        self.assertFalse(os.path.exists(out))
+
+    def _expect_cli_failure(self, db_path, out):
+        self.assertFalse(os.path.exists(out))
+        proc = subprocess.run(
+            [
+                sys.executable,
+                REPORT_PY,
+                "--db",
+                db_path,
+                "--sql",
+                SOURCE_FAILURE_SQL,
+                "--output",
+                out,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self._assert_open_failure_message(proc.stderr, db_path)
+        # 标准输出为空（不得出现成功提示），目标 CSV 不产生
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    # -- 缺失源库 --------------------------------------------------------
+
+    def test_missing_database_function_raises_and_creates_nothing(self):
+        out = os.path.join(self.tmpdir, "missing_func.csv")
+        self._expect_function_failure(self.missing_db, out)
+        # 只读打开失败不得顺手创建缺失的库文件
+        self.assertFalse(os.path.exists(self.missing_db))
+
+    def test_missing_database_cli_exits_one_with_empty_stdout(self):
+        out = os.path.join(self.tmpdir, "missing_cli.csv")
+        self._expect_cli_failure(self.missing_db, out)
+        self.assertFalse(os.path.exists(self.missing_db))
+
+    # -- 非数据库文件 ----------------------------------------------------
+
+    def test_non_database_file_function_raises_and_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "invalid_func.csv")
+        self._expect_function_failure(self.invalid_db, out)
+        # 即使查询不访问任何业务表，普通文本也应在打开阶段被拒绝，
+        # 且源文件原始字节完全不变
+        with open(self.invalid_db, "rb") as f:
+            self.assertEqual(f.read(), INVALID_DB_BYTES)
+
+    def test_non_database_file_cli_exits_one_and_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "invalid_cli.csv")
+        self._expect_cli_failure(self.invalid_db, out)
+        with open(self.invalid_db, "rb") as f:
+            self.assertEqual(f.read(), INVALID_DB_BYTES)
+
+
 if __name__ == "__main__":
     unittest.main()
