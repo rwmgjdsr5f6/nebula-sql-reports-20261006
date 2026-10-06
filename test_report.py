@@ -386,5 +386,104 @@ class ReportTestCase(unittest.TestCase):
         self.assertFalse(os.path.exists(out))
 
 
+# 普通文本伪装成数据库的固定输入：重复三十二次后加换行
+INVALID_DB_BYTES = ("not a sqlite database\n" * 32).encode("ascii")
+# 不访问任何业务表的常量查询：排除 SQL 本身成为失败原因
+LITERAL_SQL = "SELECT 1 AS 数值"
+# 源库打开失败的公开原因前缀（底层英文消息因 SQLite 版本而异，不作断言）
+OPEN_FAIL_REASON = "无法以只读方式打开数据库"
+
+
+class SourceOpenFailureTestCase(unittest.TestCase):
+    """源数据库打开失败的回归测试：缺失文件与非数据库文件两种边界。
+
+    每个用例独立准备临时目录；missing.sqlite 从不创建，invalid.sqlite
+    为固定内容的普通文本文件。输出 CSV 的父目录即临时目录（已存在），
+    目标文件名各不相同且事先不存在，保证失败只能源于源库打开阶段。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.missing_db = os.path.join(self.tmpdir, "missing.sqlite")
+        self.invalid_db = os.path.join(self.tmpdir, "invalid.sqlite")
+        with open(self.invalid_db, "wb") as f:
+            f.write(INVALID_DB_BYTES)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run_cli(self, db_path, output):
+        return subprocess.run(
+            [
+                sys.executable,
+                REPORT_PY,
+                "--db",
+                db_path,
+                "--sql",
+                LITERAL_SQL,
+                "--output",
+                output,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+
+    def _assert_source_state_unchanged(self):
+        """核对两种源库状态未被调用改变：缺失仍缺失，文本字节不变。"""
+        self.assertFalse(os.path.exists(self.missing_db))
+        with open(self.invalid_db, "rb") as f:
+            self.assertEqual(f.read(), INVALID_DB_BYTES)
+
+    def _assert_function_rejects(self, db_path, out):
+        """直接调用 export_csv：抛 ValueError，公开原因与源路径齐全。"""
+        self.assertFalse(os.path.exists(out))
+        with self.assertRaises(ValueError) as ctx:
+            report.export_csv(db_path, LITERAL_SQL, out)
+        message = str(ctx.exception)
+        self.assertIn(OPEN_FAIL_REASON, message)
+        self.assertIn(db_path, message)
+        # 拒绝路径不产生目标 CSV
+        self.assertFalse(os.path.exists(out))
+
+    def _assert_cli_rejects(self, db_path, out):
+        """命令行入口：退出码 1，标准错误给出相同原因，标准输出为空。"""
+        self.assertFalse(os.path.exists(out))
+        proc = self._run_cli(db_path, out)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(OPEN_FAIL_REASON, proc.stderr)
+        self.assertIn(db_path, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        # 拒绝路径不产生目标 CSV
+        self.assertFalse(os.path.exists(out))
+
+    # -- 源库文件缺失 ----------------------------------------------------
+
+    def test_function_missing_db_raises_and_creates_nothing(self):
+        out = os.path.join(self.tmpdir, "fn_missing.csv")
+        self._assert_function_rejects(self.missing_db, out)
+        # 只读打开绝不顺手创建缺失的源库
+        self._assert_source_state_unchanged()
+
+    def test_cli_missing_db_exit_one_stderr_reason_empty_stdout(self):
+        out = os.path.join(self.tmpdir, "cli_missing.csv")
+        self._assert_cli_rejects(self.missing_db, out)
+        self._assert_source_state_unchanged()
+
+    # -- 源库为普通文本文件 ------------------------------------------------
+
+    def test_function_invalid_db_raises_and_file_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "fn_invalid.csv")
+        # 查询不访问任何业务表，也必须在打开阶段就被拒绝
+        self._assert_function_rejects(self.invalid_db, out)
+        self._assert_source_state_unchanged()
+
+    def test_cli_invalid_db_exit_one_stderr_reason_empty_stdout(self):
+        out = os.path.join(self.tmpdir, "cli_invalid.csv")
+        self._assert_cli_rejects(self.invalid_db, out)
+        self._assert_source_state_unchanged()
+
+
 if __name__ == "__main__":
     unittest.main()
