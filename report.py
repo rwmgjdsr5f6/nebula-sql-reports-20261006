@@ -412,6 +412,28 @@ def _execute_query(db_path, sql_text, output_path, params, null_text):
     return headers, rows
 
 
+def _write_output_file(output_path, write_content):
+    """以独占新建方式打开输出目标并交给 write_content 写入，统一失败约定。
+
+    "x" = 独占新建：目标已存在则直接失败，从根本上杜绝覆盖或截断。
+    写入过程中的 OSError、UnicodeError、TypeError 一律转为 ValueError，
+    并清理本次新建的半成品文件；既存文件不可能被触及。write_content
+    接收已打开的文本文件对象，负责格式相关的内容写出。
+    """
+    try:
+        with open(output_path, "x", encoding="utf-8", newline="") as f:
+            write_content(f)
+    except FileExistsError:
+        raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
+    except (OSError, UnicodeError, TypeError) as exc:
+        # 到此的文件必为本调用刚创建的半成品，清理后报错；既存文件不可能被触及
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        raise ValueError("无法写入输出文件 %s：%s" % (output_path, exc))
+
+
 def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
 
@@ -429,24 +451,15 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
         db_path, sql_text, output_path, params, null_text
     )
 
-    # "x" = 独占新建：目标已存在则直接失败，从根本上杜绝覆盖或截断
-    try:
-        with open(output_path, "x", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-            for row in rows:
-                writer.writerow(
-                    [null_text if value is None else value for value in row]
-                )
-    except FileExistsError:
-        raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
-    except (OSError, UnicodeError, TypeError) as exc:
-        # 到此的文件必为本调用刚创建的半成品，清理后报错；既存文件不可能被触及
-        try:
-            os.remove(output_path)
-        except OSError:
-            pass
-        raise ValueError("无法写入输出文件 %s：%s" % (output_path, exc))
+    def write_csv(f):
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(
+                [null_text if value is None else value for value in row]
+            )
+
+    _write_output_file(output_path, write_csv)
 
     return len(rows)
 
@@ -506,19 +519,7 @@ def export_html(db_path, sql_text, output_path, params=None, null_text=""):
     )
     page = render_html(headers, rows, null_text)
 
-    # "x" = 独占新建：与 export_csv 相同的绝不覆盖语义
-    try:
-        with open(output_path, "x", encoding="utf-8", newline="") as f:
-            f.write(page)
-    except FileExistsError:
-        raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
-    except (OSError, UnicodeError, TypeError) as exc:
-        # 到此的文件必为本调用刚创建的半成品，清理后报错；既存文件不可能被触及
-        try:
-            os.remove(output_path)
-        except OSError:
-            pass
-        raise ValueError("无法写入输出文件 %s：%s" % (output_path, exc))
+    _write_output_file(output_path, lambda f: f.write(page))
 
     return len(rows)
 
