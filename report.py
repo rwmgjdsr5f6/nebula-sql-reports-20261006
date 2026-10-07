@@ -7,6 +7,7 @@
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
         --param who=小红 --param tag=a=b
     python report.py --db DB.sqlite --describe notes
+    python report.py --db DB.sqlite --tables
 
 --describe NAME 为只读查看单张用户表列结构的独立模式：仅与 --db 搭配，
 不需要 --sql/--sql-file 或 --output，也不与任何其他现有选项同用。成功
@@ -21,6 +22,19 @@ notnull 保留 SQLite 返回的 0/1，不因主键身份改写；pk 为 0 表示
 空白、中文/空格/引号按完整文本绑定查找，绝不作为 SQL 执行）；不
 存在的表、视图及 sqlite_ 开头的内部表统一拒绝。该模式只读取元数据，
 结构与数据保持不变；本轮不覆盖生成列、隐藏列、索引或外键展示。
+
+--tables 为只读列举可查看表名的独立模式：仅与 --db 搭配，不需要
+--sql/--sql-file 或 --output，也不与任何其他现有选项（包括显式
+--format csv）同用。成功时只向标准输出写入单列 CSV，退出码 0，标准
+错误为空，不追加提示、不创建任何文件；首行为固定表头 name，其后每个
+可查看表名一条记录。列举范围与 --describe 一致：只包含源文件主库中
+sqlite_master 内 type 为 table 且保存名称不以 sqlite_ 开头的表，视图、
+索引、触发器及 sqlite_sequence 不出现；结果按表名的 SQLite BINARY
+顺序升序（区分大小写、不按创建顺序、不去除首尾空白），中文、空格、
+逗号、双引号与换行按原始名称保留，CSV 解析后可得到完整名称并直接交给
+--describe 精确匹配。没有可列举的表时仍输出 name 表头、返回 0。该模式
+只读取元数据，不读取表内数据，不输出行数或列信息；源库以只读连接打开
+且保持不变，缺失时不会创建。
 
 --sql 与 --sql-file 必须恰好选择一个；查询文件按 UTF-8 读取（允许开头
 一个 BOM），文件内容适用与 --sql 完全相同的规则。仅接受一条 SELECT
@@ -752,6 +766,54 @@ def describe_table(db_path, table_name):
     return len(columns)
 
 
+# --tables 模式输出的固定表头；只有一列，列名固定为 name
+TABLES_HEADER = ("name",)
+
+
+def list_tables(db_path):
+    """只读列举源文件主库中可查看的用户表名，以带表头的单列 CSV 写到标准输出。
+
+    返回列出的表数量（不含表头）。列举范围与 describe_table 完全一致：
+    只包含 sqlite_master 中 type 为 "table" 且保存名称不以 "sqlite_"
+    开头的对象；视图、索引、触发器及 sqlite_sequence（在 sqlite_master
+    中登记为 table）均不出现。名称按 SQLite BINARY 排序规则升序排列：
+    区分大小写、不按创建顺序、不去除首尾空白；中文、空格、逗号、双引号
+    与换行按保存名称原样保留，经标准 CSV 规则写出后解析可得到完整名称，
+    仍可交给 describe_table 按精确匹配语义使用。
+
+    本模式只查询 sqlite_master 元数据，不读取任何表内数据，不输出行数
+    或列信息。源库缺失或损坏时由 open_readonly 抛 ValueError 且绝不创建
+    新库；元数据读取失败同样抛 ValueError，且任何失败都在写入标准输出
+    之前抛出，不会留下半截 CSV。没有可列举的表时仍写出 name 表头并
+    返回 0。
+    """
+    conn = open_readonly(db_path)
+    try:
+        try:
+            # substr 前 7 字符精确比较与 describe_table 的
+            # startswith("sqlite_") 同为区分大小写的 BINARY 语义；
+            # 不用 LIKE（其对 ASCII 字母默认大小写不敏感）
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND substr(name, 1, 7) <> 'sqlite_' "
+                "ORDER BY name COLLATE BINARY"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise ValueError("元数据读取失败：%s" % exc)
+    finally:
+        conn.close()
+
+    names = [row[0] for row in rows]
+    records = [list(TABLES_HEADER)]
+    records.extend([name] for name in names)
+
+    # 全部元数据取回成功后才写标准输出：失败路径不会产生半截 CSV。
+    # 复用现有标准 csv 方言，中文、空格、逗号、引号与换行的处理与
+    # describe 及查询导出一致
+    csv.writer(sys.stdout).writerows(records)
+    return len(names)
+
+
 class _Parser(argparse.ArgumentParser):
     """参数用法错误也按本工具的约定使用退出码 1（argparse 默认是 2）。"""
 
@@ -794,6 +856,13 @@ def parse_args(argv):
         default=None,
         help="只读查看单张用户表的列结构：CSV 写到标准输出，不需要 SQL 或输出路径；"
         "仅与 --db 搭配，不与其他任何选项同用",
+    )
+    parser.add_argument(
+        "--tables",
+        action="store_true",
+        default=False,
+        help="只读列举可查看的用户表名：单列 CSV（表头 name）写到标准输出，"
+        "不需要 SQL 或输出路径；仅与 --db 搭配，不与其他任何选项同用",
     )
     parser.add_argument("--sql", help="一条 SELECT 查询文本")
     parser.add_argument(
@@ -839,11 +908,16 @@ def parse_args(argv):
         "仅与 --format html 搭配使用",
     )
     args = parser.parse_args(argv)
-    if args.describe is not None:
-        # 表结构查看是独立模式：除帮助外仅接受 --db 与 --describe，
-        # 与其他任何现有选项同用均按参数错误拒绝（此判定先于模式各自
-        # 的必填校验，缺参与混用并存时一律报混用）
+    if args.describe is not None or args.tables:
+        # 表结构查看与表名列举都是独立模式：除帮助外仅接受 --db 与本模式
+        # 自身的开关，与其他任何现有选项（含另一个模式开关）同用均按参数
+        # 错误拒绝（此判定先于模式各自的必填校验，缺参与混用并存时一律
+        # 报混用）
+        mode_flag = "--tables" if args.tables else "--describe"
         extras = []
+        # 两个模式开关同用时，把另一个模式记为混用项
+        if args.describe is not None and args.tables:
+            extras.append("--describe" if args.tables else "--tables")
         if args.sql is not None:
             extras.append("--sql")
         if args.sql_file is not None:
@@ -864,10 +938,10 @@ def parse_args(argv):
             extras.append("--title")
         if extras:
             parser.error(
-                "--describe 仅与 --db 搭配，不能与其他选项同用：%s"
-                % " ".join(extras)
+                "%s 仅与 --db 搭配，不能与其他选项同用：%s"
+                % (mode_flag, " ".join(extras))
             )
-        if args.describe == "":
+        if args.describe is not None and args.describe == "":
             parser.error("--describe 表名不能为空")
         return args
     # 查询/导出/预览模式：未显式提供 --format 与 --null-text 时使用默认值；
@@ -919,6 +993,18 @@ def main(argv=None):
         # 成功时不追加任何提示；失败原因由 describe_table 以 ValueError 给出
         try:
             describe_table(args.db, args.describe)
+        except ValueError as exc:
+            die(str(exc))
+        except sqlite3.Error as exc:
+            die("数据库错误：%s" % exc)
+        except OSError as exc:
+            die("文件错误：%s" % exc)
+        return 0
+    if args.tables:
+        # 表名列举：独立模式，标准输出只写单列 CSV，不读取 SQL、不建文件、
+        # 成功时不追加任何提示；失败原因由 list_tables 以 ValueError 给出
+        try:
+            list_tables(args.db)
         except ValueError as exc:
             die(str(exc))
         except sqlite3.Error as exc:
