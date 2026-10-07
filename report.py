@@ -392,12 +392,16 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
                 cursor.execute(statement)
             else:
                 cursor.execute(statement, bound)
+            if cursor.description is None:
+                raise ValueError("不支持的语句：仅允许返回结果集的 SELECT")
+            headers = [desc[0] for desc in cursor.description]
+            # execute 成功只表示查询已开始执行：结果行在读取时才逐行求值，
+            # 读取期间同样可能抛出 sqlite3.Error（如
+            # abs(-9223372036854775808) 的整数溢出）。该错误与查询开始
+            # 执行时的错误统一包装，调用方无需按错误发生时点区分异常。
+            rows = cursor.fetchall()
         except sqlite3.Error as exc:
             raise ValueError("SQL 执行失败：%s" % exc)
-        if cursor.description is None:
-            raise ValueError("不支持的语句：仅允许返回结果集的 SELECT")
-        headers = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
     finally:
         conn.close()
 

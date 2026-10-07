@@ -291,9 +291,14 @@ class ReportTestCase(unittest.TestCase):
         out = os.path.join(self.tmpdir, "never.csv")
         self.assertFalse(os.path.exists(out))
 
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             report.export_csv(self.db_path, "SELECT FROM people", out)
 
+        # 查询开始执行阶段的错误沿用统一分类：ValueError 且带统一前缀
+        self.assertTrue(
+            str(ctx.exception).startswith("SQL 执行失败："),
+            str(ctx.exception),
+        )
         # 拒绝路径不创建目标文件
         self.assertFalse(os.path.exists(out))
 
@@ -385,6 +390,177 @@ class ReportTestCase(unittest.TestCase):
         # 标准输出不出现成功提示，目标文件不产生
         self.assertNotIn("已导出", proc.stdout)
         self.assertFalse(os.path.exists(out))
+
+
+# 查询开始执行成功、但读取结果（结果行逐行求值）期间才失败的固定查询：
+# 第一项可以正常求值，第二项 abs(-9223372036854775808) 触发整数溢出，
+# 该错误要到 fetchall 读取结果时才由 SQLite 抛出
+OVERFLOW_SQL = "SELECT 1 AS 数值 UNION ALL SELECT abs(-9223372036854775808)"
+# 失败后在同一输出路径执行的恢复查询：表头相同、两行均可正常求值
+RECOVER_SQL = "SELECT 1 AS 数值 UNION ALL SELECT 2"
+SQL_EXEC_FAIL_PREFIX = "SQL 执行失败："
+# 底层原始原因的核心文本（完整消息随 SQLite 版本可能略有差异，不断言全文）
+OVERFLOW_REASON_PART = "integer overflow"
+
+
+class ResultReadFailureTestCase(unittest.TestCase):
+    """结果读取期间 SQLite 错误与查询开始执行错误统一分类的回归测试。
+
+    每个用例独立准备临时目录与小型合成库；tearDown 重新只读打开源库，
+    核对表结构与全部数据相对准备基线零变化。溢出查询第一项可正常求值、
+    第二项才在读取结果时触发整数溢出：函数入口必须抛 ValueError（信息以
+    "SQL 执行失败："开头并保留底层原因），不返回数据行数、不创建 CSV，
+    即使前面的结果已经可用也不得作为成功写出；命令行 --sql 与 --sql-file
+    入口均退出码 1、标准输出为空、标准错误以"错误: SQL 执行失败："开头并
+    带原始原因，无异常堆栈与成功提示。随后同一输出路径可正常恢复导出。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "sample.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，tearDown 中逐一核对
+        self._baseline = self._snapshot_db()
+
+    def tearDown(self):
+        # 每个用例（无论成功或失败）结束后，重新只读打开源库，
+        # 核对表结构及全部数据与准备完成时完全一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO t (id, v) VALUES (?, ?)",
+                [(1, "甲"), (2, "乙")],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        """以只读方式重新读取源库的表结构与 t 表全部数据。"""
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            rows = conn.execute("SELECT id, v FROM t ORDER BY id").fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "rows": rows}
+
+    @staticmethod
+    def _read_csv(path):
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        return text, list(csv.reader(io.StringIO(text)))
+
+    def _run_cli(self, output, sql=None, sql_file=None):
+        cmd = [sys.executable, REPORT_PY, "--db", self.db_path]
+        if sql is not None:
+            cmd += ["--sql", sql]
+        if sql_file is not None:
+            cmd += ["--sql-file", sql_file]
+        cmd += ["--output", output]
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    def _assert_read_failure_error(self, message):
+        """统一分类：信息以 SQL 执行失败：开头，并保留底层溢出原因。"""
+        self.assertTrue(
+            message.startswith(SQL_EXEC_FAIL_PREFIX), message
+        )
+        self.assertIn(OVERFLOW_REASON_PART, message)
+
+    # -- 函数入口：读取结果期间失败 ---------------------------------------
+
+    def test_function_overflow_during_fetch_raises_valueerror_no_file(self):
+        out = os.path.join(self.tmpdir, "overflow.csv")
+        self.assertFalse(os.path.exists(out))
+
+        # 不返回数据行数：统一抛 ValueError，而非裸 sqlite3.Error
+        with self.assertRaises(ValueError) as ctx:
+            report.export_csv(self.db_path, OVERFLOW_SQL, out)
+        self._assert_read_failure_error(str(ctx.exception))
+
+        # 即使第一项结果已可求值，也绝不能作为成功写出：不创建任何 CSV
+        self.assertFalse(os.path.exists(out))
+
+    # -- 命令行 --sql：读取结果期间失败 -----------------------------------
+
+    def test_cli_sql_overflow_exit_one_empty_stdout_prefix_stderr(self):
+        out = os.path.join(self.tmpdir, "cli_overflow_sql.csv")
+        self.assertFalse(os.path.exists(out))
+
+        proc = self._run_cli(out, sql=OVERFLOW_SQL)
+
+        self.assertEqual(proc.returncode, 1)
+        # 标准输出为空：无成功提示、无数据行数
+        self.assertEqual(proc.stdout, "")
+        # 标准错误以统一前缀开头并带原始原因；不泄露异常堆栈
+        self.assertTrue(
+            proc.stderr.startswith("错误: " + SQL_EXEC_FAIL_PREFIX),
+            proc.stderr,
+        )
+        self.assertIn(OVERFLOW_REASON_PART, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("已导出", proc.stderr)
+        # 不创建目标 CSV
+        self.assertFalse(os.path.exists(out))
+
+    # -- 命令行 --sql-file：读取结果期间失败 -------------------------------
+
+    def test_cli_sql_file_overflow_exit_one_and_query_bytes_unchanged(self):
+        sql_path = os.path.join(self.tmpdir, "查询.sql")
+        payload = (OVERFLOW_SQL + ";\n").encode("utf-8")
+        with open(sql_path, "wb") as f:
+            f.write(payload)
+        out = os.path.join(self.tmpdir, "cli_overflow_file.csv")
+        self.assertFalse(os.path.exists(out))
+
+        proc = self._run_cli(out, sql_file=sql_path)
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertTrue(
+            proc.stderr.startswith("错误: " + SQL_EXEC_FAIL_PREFIX),
+            proc.stderr,
+        )
+        self.assertIn(OVERFLOW_REASON_PART, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("已导出", proc.stderr)
+        self.assertFalse(os.path.exists(out))
+        # 查询文件只被读取，字节保持不变
+        with open(sql_path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    # -- 失败后的恢复：同一输出路径正常导出 --------------------------------
+
+    def test_recovery_on_same_output_path_after_read_failure(self):
+        out = os.path.join(self.tmpdir, "recover.csv")
+
+        # 先经历读取结果期间的失败
+        with self.assertRaises(ValueError):
+            report.export_csv(self.db_path, OVERFLOW_SQL, out)
+        self.assertFalse(os.path.exists(out))
+
+        # 同一输出路径随即执行可正常求值的查询：返回 2 行
+        count = report.export_csv(self.db_path, RECOVER_SQL, out)
+        self.assertEqual(count, 2)
+
+        text, rows = self._read_csv(out)
+        # 表头为 数值，数据依次为 1、2
+        self.assertEqual(rows, [["数值"], ["1"], ["2"]])
+        self.assertTrue(text.startswith("数值\r\n"))
 
 
 # 普通文本伪装成数据库的固定输入：重复三十二次后加换行
