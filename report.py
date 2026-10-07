@@ -460,6 +460,23 @@ def _write_output_file(output_path, write_content):
         raise ValueError("无法写入输出文件 %s：%s" % (output_path, exc))
 
 
+def _csv_records(headers, rows, null_text):
+    """把查询结果展开为 CSV 逻辑记录序列：首条为列名，其后每行数据一条记录。
+
+    只有 NULL 替换为 null_text；空字符串、零值及与标记同形的普通文本
+    原样保留，列名、列顺序与查询返回的行顺序不变。export_csv 与
+    preview_csv 共用这一份表达规则，保证两条入口对同一查询输出一致。
+    """
+    yield list(headers)
+    for row in rows:
+        yield [null_text if value is None else value for value in row]
+
+
+def _write_csv_records(fileobj, headers, rows, null_text):
+    """按共用 CSV 规则把表头与数据记录写入已打开的文本流（标准 csv 方言）。"""
+    csv.writer(fileobj).writerows(_csv_records(headers, rows, null_text))
+
+
 def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
 
@@ -477,15 +494,9 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
         db_path, sql_text, output_path, params, null_text
     )
 
-    def write_csv(f):
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        for row in rows:
-            writer.writerow(
-                [null_text if value is None else value for value in row]
-            )
-
-    _write_output_file(output_path, write_csv)
+    _write_output_file(
+        output_path, lambda f: _write_csv_records(f, headers, rows, null_text)
+    )
 
     return len(rows)
 
@@ -502,7 +513,7 @@ def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
     条时全部显示，零行结果只显示表头。列名、列顺序与查询返回的行顺序
     保持一致，查询的筛选、排序和 LIMIT 语义原样保留。SQL NULL 写
     null_text（默认空字段），非空值不额外替换；中文、逗号、引号及换行
-    遵循与文件导出相同的 CSV 规则。
+    由 _write_csv_records 按与文件导出完全相同的 CSV 规则写出。
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("preview 行数必须是正整数，收到 %r" % (limit,))
@@ -521,11 +532,8 @@ def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
         conn.close()
 
     # 全部结果求值成功后才开始写标准输出：失败路径不会留下部分预览
-    writer = csv.writer(sys.stdout)
-    writer.writerow(headers)
     shown = rows[:limit]
-    for row in shown:
-        writer.writerow([null_text if value is None else value for value in row])
+    _write_csv_records(sys.stdout, headers, shown, null_text)
     return len(shown)
 
 
