@@ -8,6 +8,7 @@
     python -m unittest discover
 """
 
+import contextlib
 import csv
 import html
 import io
@@ -2971,6 +2972,319 @@ class HtmlDescriptionTestCase(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
         with open(out, "rb") as f:
             self.assertEqual(f.read(), original_bytes)
+
+
+# ---- 终端预览（--preview / preview_csv）----
+# 与验收相同的 people/notes 合成样例：小明备注为 SQL NULL，
+# 小红备注为含逗号、双引号的中文；空值标记固定为“未填写”
+PREVIEW_MARKER = "未填写"
+# 降序并带 LIMIT 1 的关联查询：只应显示小红及其备注
+PREVIEW_DESC_LIMIT_SQL = (
+    "SELECT p.name AS 姓名, n.note AS 备注 "
+    "FROM people p JOIN notes n ON p.id=n.person_id "
+    "ORDER BY p.id DESC LIMIT 1"
+)
+
+
+class PreviewTestCase(unittest.TestCase):
+    """--preview / preview_csv 终端预览的可重复回归测试。
+
+    每个用例独立准备临时目录与 people/notes 样例库（编号 1 小明备注为
+    SQL NULL，编号 2 小红备注为含逗号、双引号的中文）。预览只写标准
+    输出：用例内逐一核对临时目录没有新增报告或临时文件；tearDown
+    重新只读打开源库，核对两表结构及全部数据相对基线零变化。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "sample.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构、数据与目录内容基线，用例内与 tearDown 中核对
+        self._baseline = self._snapshot_db()
+        self._files_baseline = set(os.listdir(self.tmpdir))
+
+    def tearDown(self):
+        # 每个用例（无论成功或失败）结束后，重新只读打开源库，
+        # 核对两表结构及全部数据与准备完成时完全一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE people ("
+                "id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE notes ("
+                "person_id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                [(1, "小明"), (2, "小红")],
+            )
+            # 两人的备注分别为 SQL NULL 与含逗号、双引号的中文
+            conn.executemany(
+                "INSERT INTO notes (person_id, note) VALUES (?, ?)",
+                [(1, None), (2, NOTE_VALUE)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        """以只读方式重新读取源库的表结构与两表全部数据。"""
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            people = conn.execute(
+                "SELECT id, name FROM people ORDER BY id"
+            ).fetchall()
+            notes = conn.execute(
+                "SELECT person_id, note FROM notes ORDER BY person_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "people": people, "notes": notes}
+
+    def _assert_no_new_files(self):
+        """预览不创建报告或临时文件：临时目录内容与基线完全一致。"""
+        self.assertEqual(set(os.listdir(self.tmpdir)), self._files_baseline)
+
+    def _call_preview(self, sql, limit, **kwargs):
+        """捕获标准输出调用 preview_csv，返回 (返回值, 解析后的 CSV 行, 原文)。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            count = report.preview_csv(self.db_path, sql, limit, **kwargs)
+        text = buf.getvalue()
+        return count, list(csv.reader(io.StringIO(text))), text
+
+    def _run_cli(self, extra):
+        cmd = [sys.executable, REPORT_PY, "--db", self.db_path] + list(extra)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    @staticmethod
+    def _parse_stdout(proc):
+        """把命令行标准输出按 CSV 解析为逻辑行。"""
+        return list(csv.reader(io.StringIO(proc.stdout)))
+
+    def _assert_cli_success(self, proc, expected_rows):
+        """成功预览的公共核对：退出码、空标准错误、标准输出仅为 CSV。"""
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        # 标准输出仅为 CSV，不追加成功提示
+        self.assertNotIn("已导出", proc.stdout)
+        self.assertEqual(self._parse_stdout(proc), expected_rows)
+        # 预览不创建报告或临时文件
+        self._assert_no_new_files()
+
+    def _assert_cli_rejected(self, proc, reason_part=None, absent_path=None):
+        """失败预览的公共核对：退出码 1、标准错误含原因、标准输出为空。"""
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误", proc.stderr)
+        if reason_part is not None:
+            self.assertIn(reason_part, proc.stderr)
+        # 预览失败时标准输出为空：不留下表头或部分数据
+        self.assertEqual(proc.stdout, "")
+        if absent_path is not None:
+            # 不创建输出文件
+            self.assertFalse(os.path.exists(absent_path))
+        self._assert_no_new_files()
+
+    # -- 函数入口：正常路径 ------------------------------------------------
+
+    def test_function_preview_one_row_returns_one(self):
+        count, rows, text = self._call_preview(JOIN_SQL, 1)
+
+        # 只预览一行：表头 + 小明与空备注（NULL 默认为空字段）
+        self.assertEqual(count, 1)
+        self.assertEqual(rows, [["姓名", "备注"], ["小明", ""]])
+        # 标准输出仅为 CSV 本身
+        self.assertEqual(text, "姓名,备注\r\n小明,\r\n")
+        self._assert_no_new_files()
+
+    def test_function_limit_above_result_returns_two_rows(self):
+        count, rows, text = self._call_preview(JOIN_SQL, 10)
+
+        # 上限大于结果数：全部两行都显示并返回 2
+        self.assertEqual(count, 2)
+        self.assertEqual(
+            rows,
+            [["姓名", "备注"], ["小明", ""], ["小红", NOTE_VALUE]],
+        )
+        # 中文、逗号、引号按 CSV 解析后完整还原（上行已核对解析结果）；
+        # 原文层面含逗号/引号的字段被整体加引号，内部引号双写
+        self.assertIn('"中文,含""引号"""', text)
+        self._assert_no_new_files()
+
+    def test_function_zero_rows_header_only_returns_zero(self):
+        sql = (
+            "SELECT p.name AS 姓名, n.note AS 备注 "
+            "FROM people p JOIN notes n ON p.id=n.person_id "
+            "WHERE p.id < 0"
+        )
+        count, rows, text = self._call_preview(sql, 5)
+
+        # 零行查询只保留表头并返回 0
+        self.assertEqual(count, 0)
+        self.assertEqual(rows, [["姓名", "备注"]])
+        self.assertEqual(text, "姓名,备注\r\n")
+        self._assert_no_new_files()
+
+    def test_function_desc_limit_one_shows_xiaohong(self):
+        count, rows, _ = self._call_preview(PREVIEW_DESC_LIMIT_SQL, 5)
+
+        # 降序且带 LIMIT 1 的查询只显示小红；筛选、排序和 LIMIT 语义保留
+        self.assertEqual(count, 1)
+        self.assertEqual(rows, [["姓名", "备注"], ["小红", NOTE_VALUE]])
+        self._assert_no_new_files()
+
+    # -- 命令行入口：正常路径 ------------------------------------------------
+
+    def test_cli_sql_param_preview_one_row_with_marker(self):
+        proc = self._run_cli(
+            [
+                "--sql", JOIN_WHO_SQL,
+                "--preview", "5",
+                "--param", "who=小明",
+                "--null-text", PREVIEW_MARKER,
+            ]
+        )
+        # 表头 + 一行小明、未填写；退出 0，标准错误为空，标准输出仅为 CSV
+        self._assert_cli_success(
+            proc, [["姓名", "备注"], ["小明", PREVIEW_MARKER]]
+        )
+        # 标准输出恰好是表头与一行数据的 CSV 文本，没有任何附加提示
+        self.assertEqual(
+            proc.stdout.replace("\r\n", "\n"),
+            "姓名,备注\n小明,%s\n" % PREVIEW_MARKER,
+        )
+
+    def test_cli_bom_sql_file_same_result_and_bytes_unchanged(self):
+        # 与 --sql 相同的参数化查询，写入开头恰一个 BOM 的 UTF-8 查询文件
+        sql_path = os.path.join(self.tmpdir, "查询.sql")
+        payload = b"\xef\xbb\xbf" + JOIN_WHO_SQL.encode("utf-8")
+        with open(sql_path, "wb") as f:
+            f.write(payload)
+        # 查询文件由本用例创建，纳入目录基线
+        self._files_baseline = set(os.listdir(self.tmpdir))
+
+        proc = self._run_cli(
+            [
+                "--sql-file", sql_path,
+                "--preview", "5",
+                "--param", "who=小明",
+                "--null-text", PREVIEW_MARKER,
+            ]
+        )
+        # 与 --sql 入口得到相同的表头和一行小明、未填写
+        self._assert_cli_success(
+            proc, [["姓名", "备注"], ["小明", PREVIEW_MARKER]]
+        )
+        # 查询文件只被读取，字节不变
+        with open(sql_path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_cli_default_format_matches_explicit_csv(self):
+        base_args = ["--sql", JOIN_SQL, "--preview", "2"]
+        proc_default = self._run_cli(base_args)
+        proc_explicit = self._run_cli(base_args + ["--format", "csv"])
+
+        for proc in (proc_default, proc_explicit):
+            self._assert_cli_success(
+                proc,
+                [["姓名", "备注"], ["小明", ""], ["小红", NOTE_VALUE]],
+            )
+        # 默认格式与显式 --format csv 的标准输出完全一致
+        self.assertEqual(proc_default.stdout, proc_explicit.stdout)
+
+    # -- 函数入口：非法行数被拒绝，标准输出为空 ------------------------------
+
+    def test_function_invalid_limit_values_raise_valueerror(self):
+        for bad in (0, -1, -100, True, False, "2", 1.5, None):
+            with self.subTest(limit=bad):
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    with self.assertRaises(ValueError):
+                        report.preview_csv(self.db_path, JOIN_SQL, bad)
+                # 拒绝路径标准输出为空：不留下表头或部分数据
+                self.assertEqual(buf.getvalue(), "")
+                self._assert_no_new_files()
+
+    # -- 命令行入口：非法行数被拒绝 ------------------------------------------
+
+    def test_cli_preview_missing_value_exit_one(self):
+        # --preview 放在末尾使其后面无值可消费，触发缺值错误
+        proc = self._run_cli(["--sql", JOIN_SQL, "--preview"])
+        self._assert_cli_rejected(proc, "--preview")
+
+    def test_cli_preview_zero_negative_noninteger_exit_one(self):
+        for value in ("0", "-3", "abc", "1.5"):
+            with self.subTest(preview=value):
+                proc = self._run_cli(
+                    ["--sql", JOIN_SQL, "--preview", value]
+                )
+                self._assert_cli_rejected(proc)
+
+    # -- 命令行入口：预览与导出选项互斥 --------------------------------------
+
+    def test_cli_preview_with_output_rejected_no_file(self):
+        out = os.path.join(self.tmpdir, "preview_out.csv")
+        self.assertFalse(os.path.exists(out))
+        proc = self._run_cli(
+            ["--sql", JOIN_SQL, "--preview", "1", "--output", out]
+        )
+        self._assert_cli_rejected(proc, "--output", absent_path=out)
+
+    def test_cli_preview_with_html_format_rejected(self):
+        proc = self._run_cli(
+            ["--sql", JOIN_SQL, "--preview", "1", "--format", "html"]
+        )
+        self._assert_cli_rejected(proc, "html")
+
+    def test_cli_preview_with_description_rejected(self):
+        for description in ("查询说明", ""):
+            with self.subTest(description=description):
+                # 显式提供 --description（即使为空）同样拒绝
+                proc = self._run_cli(
+                    ["--sql", JOIN_SQL, "--preview", "1",
+                     "--description", description]
+                )
+                self._assert_cli_rejected(proc, "--description")
+
+    # -- 结果求值失败：两种入口都不留下表头或部分数据 --------------------------
+
+    def test_function_overflow_preview_raises_valueerror_empty_stdout(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            # 即使只预览一行，fetchall 期间的整数溢出也必须抛 ValueError
+            with self.assertRaises(ValueError) as ctx:
+                report.preview_csv(self.db_path, OVERFLOW_SQL, 1)
+        message = str(ctx.exception)
+        self.assertIn(SQL_EXEC_FAIL_PREFIX, message)
+        self.assertIn(OVERFLOW_REASON, message)
+        # 失败路径标准输出为空：不留下表头或部分数据
+        self.assertEqual(buf.getvalue(), "")
+        self._assert_no_new_files()
+
+    def test_cli_overflow_preview_exit_one_stderr_reason_empty_stdout(self):
+        proc = self._run_cli(["--sql", OVERFLOW_SQL, "--preview", "1"])
+        self.assertEqual(proc.returncode, 1)
+        # 标准错误包含 SQL 执行失败与底层整数溢出原因
+        self.assertIn(SQL_EXEC_FAIL_PREFIX, proc.stderr)
+        self.assertIn(OVERFLOW_REASON, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        # 标准输出为空：不留下表头或部分数据
+        self.assertEqual(proc.stdout, "")
+        self._assert_no_new_files()
 
 
 if __name__ == "__main__":
