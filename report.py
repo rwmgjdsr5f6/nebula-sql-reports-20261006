@@ -6,6 +6,7 @@
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
         --param who=小红 --param tag=a=b
+    python report.py --db DB.sqlite --describe notes
 
 --sql 与 --sql-file 必须恰好选择一个；查询文件按 UTF-8 读取（允许开头
 一个 BOM），文件内容适用与 --sql 完全相同的规则。仅接受一条 SELECT
@@ -61,6 +62,24 @@ csv、省略格式或使用 --preview 时按参数错误拒绝，标题缺少文
 显示，零行只显示表头），退出码为 0，标准错误为空，不追加成功提示；
 列名、列顺序、行顺序与查询结果一致，筛选、排序和 LIMIT 语义保留。
 预览不创建报告或临时文件，源库和查询文件保持不变。
+
+--describe TABLE 提供只读查看单张用户表声明列结构的入口，便于编写 SQL
+前核对字段定义：仅接受 --db 与 --describe，不需要 --sql/--sql-file 或
+--output，与 --sql、--sql-file、--output、--preview、--format、--param、
+--null-text、--description、--title 中任何选项同用均按参数错误拒绝。
+成功时标准输出仅包含带表头的 CSV（退出 0、标准错误为空、不追加提示、
+不创建文件），首行为 cid,name,type,notnull,dflt_value,pk，之后每个
+声明列一条记录，按数据库中的列序号（cid 从 0 开始）升序。cid 与 pk
+保留 SQLite 元数据中的整数：notnull 为返回的 0 或 1，不因主键身份自行
+改为非空；pk 为 0 表示不属于主键，非零值即主键中的序号。没有声明类型
+时类型字段为空；没有默认值时默认表达式为空，显式 DEFAULT NULL 保留
+文本 NULL，其他默认表达式按元数据原文写出、不求值。表名按保存名称
+精确匹配（区分大小写、不去除首尾空白、可含中文/空格/引号），只作为
+绑定参数查询，不被当作 SQL 执行；名称不存在、指向视图或为 sqlite_
+开头的内部表时统一拒绝，标准错误包含“未找到可查看的用户表”与传入
+名称。表名为空、源库缺失（不会被创建）、源文件不是有效 SQLite 数据库
+或元数据读取失败时退出 1、标准输出为空、标准错误以“错误: ”前缀说明
+原因。本轮仅展示普通表的声明列，不扩展生成列、隐藏列、索引或外键。
 """
 
 import argparse
@@ -562,6 +581,80 @@ def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
     return len(shown)
 
 
+# 表结构查看模式的固定 CSV 表头：列序、列名、声明类型、非空标记、
+# 默认表达式、主键序号，与 PRAGMA table_info 的六个字段一一对应
+DESCRIBE_HEADER = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+
+
+def describe_table(db_path, table_name):
+    """只读查看单张普通用户表的声明列结构，把固定表头加每列一条 CSV 写到标准输出。
+
+    table_name 按数据库中保存的名称精确匹配：区分大小写、不去除首尾空白，
+    整段文本只以绑定参数形式查询（sqlite_master 与 pragma_table_info 均用
+    "?" 占位），绝不拼接进 SQL 文本，也不会被当作语句执行。名称不存在、
+    指向视图、或以 sqlite_ 开头的内部表一律拒绝，抛 ValueError 且标准
+    输出尚未写入任何内容。
+
+    每个声明列对应一条记录，按数据库中的列序号 cid（从 0 开始）升序：
+    notnull 与 pk 保留 SQLite 元数据返回的 0 或非零值，不因主键身份自行
+    把 notnull 改成 1；没有声明类型时 type 为空字段；dflt_value 仅在没有
+    默认值时为空字段，显式 DEFAULT NULL 保留文本 NULL，其他默认表达式按
+    元数据原文写出、不求值。列名、类型与默认文本中的中文、空格、逗号和
+    引号按与查询导出相同的 CSV 规则保留。本轮仅展示普通表的声明列，不
+    扩展生成列、隐藏列、索引或外键信息。
+
+    源库经 open_readonly 以只读方式打开：缺失时不会创建，不是有效 SQLite
+    数据库时打开阶段即失败；元数据查询本身失败同样抛 ValueError。成功
+    与失败后源库的结构与数据均保持不变，本函数不创建任何文件。
+    """
+    if not isinstance(table_name, str) or table_name == "":
+        raise ValueError("表名不能为空")
+    conn = open_readonly(db_path)
+    try:
+        try:
+            # sqlite_ 前缀为 SQLite 保留的内部表命名空间（如
+            # sqlite_sequence、sqlite_stat1），即便存在于 sqlite_master
+            # 也不作为可查看的用户表
+            if table_name.startswith("sqlite_"):
+                raise ValueError(
+                    "未找到可查看的用户表：%r" % (table_name,)
+                )
+            row = conn.execute(
+                "SELECT type FROM sqlite_master "
+                "WHERE type IN ('table', 'view') AND name = ?",
+                (table_name,),
+            ).fetchone()
+            if row is None or row[0] != "table":
+                # 名称不存在或指向视图：统一拒绝且消息中带回传入名称
+                raise ValueError(
+                    "未找到可查看的用户表：%r" % (table_name,)
+                )
+            # 表名只作为绑定参数传给表值 pragma 函数，不进入 SQL 文本；
+            # pragma_table_info 恰返回所需六列且不包含虚拟表隐藏列
+            records = conn.execute(
+                'SELECT cid, name, type, "notnull", dflt_value, pk '
+                "FROM pragma_table_info(?) ORDER BY cid",
+                (table_name,),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise ValueError("读取表结构元数据失败：%s" % exc)
+    finally:
+        conn.close()
+
+    # 全部元数据取回、连接关闭后才开始写标准输出：拒绝路径没有部分输出
+    lines = [DESCRIBE_HEADER]
+    for cid, name, ctype, notnull, dflt, pk in records:
+        lines.append([
+            str(cid),
+            name,
+            ctype if ctype is not None else "",
+            str(notnull),
+            dflt if dflt is not None else "",
+            str(pk),
+        ])
+    csv.writer(sys.stdout).writerows(lines)
+
+
 def render_html(headers, rows, null_text, description="", title="查询报告"):
     """把查询结果渲染为独立 HTML 页面文本（UTF-8，不依赖外部资源）。
 
@@ -719,9 +812,16 @@ def parse_args(argv):
         help="在终端预览前 N 行（正整数）：CSV 写到标准输出，不创建输出文件",
     )
     parser.add_argument(
+        "--describe",
+        metavar="TABLE",
+        default=None,
+        help="只读查看单张普通用户表的声明列结构：CSV 写到标准输出，"
+        "不需要 --sql/--sql-file 与 --output；仅接受 --db 与 --describe",
+    )
+    parser.add_argument(
         "--format",
         choices=["csv", "html"],
-        default="csv",
+        default=None,
         help="输出格式：csv（默认）或 html；输出类型只由该选项决定",
     )
     parser.add_argument(
@@ -733,7 +833,7 @@ def parse_args(argv):
     parser.add_argument(
         "--null-text",
         metavar="MARKER",
-        default="",
+        default=None,
         help="SQL NULL 在输出中的导出标记，默认为空；标记原样写入，可含空格、逗号、引号与换行",
     )
     parser.add_argument(
@@ -750,7 +850,43 @@ def parse_args(argv):
         "仅与 --format html 搭配使用",
     )
     args = parser.parse_args(argv)
-    # 恰好选择一个查询来源；此判定发生在读文件与开库之前
+    if args.describe is not None:
+        # 表结构查看模式：除 --db 与 --describe 外不接受任何现有选项；
+        # --db 已由 argparse 强制提供，下列判定均发生在读文件与开库之前。
+        # --format 与 --null-text 的默认值改为 None 作为哨兵，使显式提供
+        # （即使值为空字符串）也能被识别并拒绝
+        if args.sql is not None:
+            parser.error("--describe 不接受 --sql：查看表结构不需要 SQL")
+        if args.sql_file is not None:
+            parser.error(
+                "--describe 不接受 --sql-file：查看表结构不需要查询文件"
+            )
+        if args.output is not None:
+            parser.error(
+                "--describe 不接受 --output：表结构 CSV 只写到标准输出"
+            )
+        if args.preview is not None:
+            parser.error("--describe 不接受 --preview")
+        if args.format is not None:
+            parser.error("--describe 不接受 --format：表结构固定以 CSV 输出")
+        if args.param:
+            parser.error("--describe 不接受 --param：查看表结构不使用查询参数")
+        if args.null_text is not None:
+            parser.error("--describe 不接受 --null-text")
+        if args.description is not None:
+            parser.error("--describe 不接受 --description")
+        if args.title is not None:
+            parser.error("--describe 不接受 --title")
+        if args.describe == "":
+            parser.error("--describe 的表名不能为空")
+        return args
+    # 非查看模式下，未提供的 --format 与 --null-text 恢复为既有默认值，
+    # 使后续校验与 main 分支沿用原有字符串比较
+    if args.format is None:
+        args.format = "csv"
+    if args.null_text is None:
+        args.null_text = ""
+    # 查询/导出/预览模式：恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
         parser.error("--sql 与 --sql-file 必须恰好选择一个")
     if args.preview is not None:
@@ -788,6 +924,18 @@ def parse_args(argv):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.describe is not None:
+        # 表结构查看：标准输出只写带表头的 CSV，成功时不追加任何提示，
+        # 不创建文件；失败原因统一带“错误: ”前缀写入标准错误
+        try:
+            describe_table(args.db, args.describe)
+        except ValueError as exc:
+            die(str(exc))
+        except sqlite3.Error as exc:
+            die("数据库错误：%s" % exc)
+        except OSError as exc:
+            die("文件错误：%s" % exc)
+        return 0
     sql_text = args.sql
     if sql_text is None:
         # 先读查询文件：文件类失败时不接触源库与输出目标
