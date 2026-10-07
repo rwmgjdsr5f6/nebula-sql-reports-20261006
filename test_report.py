@@ -707,6 +707,212 @@ class ResultEvaluationFailureTestCase(unittest.TestCase):
             self.assertEqual(f.read(), recovery_payload)
 
 
+class HtmlResultEvaluationFailureTestCase(unittest.TestCase):
+    """HTML 路径在读取结果阶段求值失败的回归测试：与 CSV 侧一一对应。
+
+    与 ResultEvaluationFailureTestCase 使用同一条 OVERFLOW_SQL：execute
+    成功、表头就绪、第一项可求值，fetchall 读取第二项 abs(-2^63) 时
+    SQLite 才报整数溢出（真实 SQLite 错误，不由缺失库、语法错误或替代
+    异常模拟）。export_html 必须抛 ValueError（信息以“SQL 执行失败：”
+    开头并含底层原因）、不返回行数、不创建目标页面；--format html 搭配
+    --sql 与 --sql-file 的命令行必须以退出码 1、空标准输出、“错误:
+    SQL 执行失败：”开头且不含 Traceback 的标准错误结束。已可用的第一项
+    结果不得当作成功报告写出：所有失败调用结束后目标均不存在。
+
+    每条失败用例随后在同一源库、同一输出路径执行 RECOVERY_SQL：函数
+    返回 2；命令行退出 0、标准错误为空、标准输出恰为一行现有格式的
+    成功提示。生成的 UTF-8 页面保留“查询报告”标题，只有一张表头为
+    “数值”、数据依次为 1、2 的结果表（表头不计入返回行数）。失败后
+    与恢复后分别以只读连接重读源库，核对表结构与全部记录与准备基线
+    一致；文件入口另核对失败查询与恢复查询文件的原始字节未变。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "sample.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，用例内与 tearDown 中逐一核对
+        self._baseline = self._snapshot_db()
+
+    def tearDown(self):
+        # 每个用例（无论成功或失败）结束后，重新只读打开源库，
+        # 核对表结构及全部数据与准备完成时完全一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        # 失败查询不访问业务表，但仍准备一张带中文数据的表，
+        # 以便基线核对失败调用确实没有改动源库结构与数据
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE people ("
+                "id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            )
+            conn.executemany(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                [(1, "小明"), (2, "小红")],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        """以只读方式重新读取源库的表结构与 people 全部数据。"""
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            people = conn.execute(
+                "SELECT id, name FROM people ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "people": people}
+
+    def _run_cli(self, output, sql=None, sql_file=None):
+        cmd = [sys.executable, REPORT_PY, "--db", self.db_path]
+        if sql is not None:
+            cmd += ["--sql", sql]
+        if sql_file is not None:
+            cmd += ["--sql-file", sql_file]
+        cmd += ["--output", output, "--format", "html"]
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    def _assert_recovery_page(self, path):
+        """核对恢复导出的 UTF-8 页面：标题、单表、表头“数值”、数据 1 与 2。"""
+        with open(path, "rb") as f:
+            text = f.read().decode("utf-8")
+        # 独立的 UTF-8 页面：声明字符编码，标题为“查询报告”
+        self.assertTrue(text.startswith("<!DOCTYPE html>"))
+        self.assertIn('<meta charset="utf-8">', text)
+        self.assertIn("<title>查询报告</title>", text)
+        parser = _HtmlTableParser()
+        parser.feed(text)
+        parser.close()
+        # 页面只有一张结果表；表头不计入数据行：恰为一行 th 加两行 td
+        self.assertEqual(len(parser.tables), 1)
+        self.assertEqual(
+            parser.tables[0],
+            [
+                [("th", "数值")],
+                [("td", "1")],
+                [("td", "2")],
+            ],
+        )
+
+    def _assert_cli_overflow_failure(self, proc, out):
+        """统一核对命令行失败：退出码 1、空标准输出、标准错误前缀与原因。"""
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertTrue(
+            proc.stderr.startswith(CLI_SQL_EXEC_FAIL_PREFIX),
+            "标准错误应以 %r 开头，实际为 %r"
+            % (CLI_SQL_EXEC_FAIL_PREFIX, proc.stderr),
+        )
+        # 带有原始原因；不输出异常堆栈或成功提示
+        self.assertIn(OVERFLOW_REASON, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertNotIn("已导出", proc.stderr)
+        # 已可用的第一项结果不得当作成功报告：目标不存在
+        self.assertFalse(os.path.exists(out))
+
+    # -- 函数入口：失败后同一输出路径恢复导出 ------------------------------
+
+    def test_function_overflow_then_recovery_same_path_exports_two_rows(self):
+        out = os.path.join(self.tmpdir, "overflow.html")
+        # 输出父目录已存在，目标起初不存在
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(out))
+
+        # OperationalError 属于 sqlite3.Error 而不属于 ValueError，
+        # 若底层错误直接漏出，assertRaises(ValueError) 即会失败
+        with self.assertRaises(ValueError) as ctx:
+            report.export_html(self.db_path, OVERFLOW_SQL, out)
+        message = str(ctx.exception)
+        self.assertTrue(
+            message.startswith(SQL_EXEC_FAIL_PREFIX),
+            "错误信息应以 %r 开头，实际为 %r" % (SQL_EXEC_FAIL_PREFIX, message),
+        )
+        # 保留底层 SQLite 原因
+        self.assertIn(OVERFLOW_REASON, message)
+
+        # 即使第一项结果已可求值，也不返回行数、不创建目标页面
+        self.assertFalse(os.path.exists(out))
+        # 失败后只读重读源库：结构与全部记录与初始状态一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+
+        # 失败未留下阻碍后续导出的目标文件：同一输出路径正常导出
+        count = report.export_html(self.db_path, RECOVERY_SQL, out)
+        self.assertEqual(count, 2)
+        self._assert_recovery_page(out)
+        # 恢复后再次只读重读源库：结构与全部记录仍与初始状态一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+
+    # -- 命令行 --sql：失败后同一输出路径恢复成功 --------------------------
+
+    def test_cli_sql_overflow_then_recovery_same_path_exports_two_rows(self):
+        out = os.path.join(self.tmpdir, "cli_sql_overflow.html")
+        self.assertFalse(os.path.exists(out))
+
+        proc_fail = self._run_cli(out, sql=OVERFLOW_SQL)
+        self._assert_cli_overflow_failure(proc_fail, out)
+        # 失败后只读重读源库：结构与全部记录与初始状态一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+
+        proc_ok = self._run_cli(out, sql=RECOVERY_SQL)
+        self.assertEqual(proc_ok.returncode, 0, proc_ok.stderr)
+        self.assertEqual(proc_ok.stderr, "")
+        # 标准输出只含一行现有格式的成功提示：数据行数 2 与目标路径
+        self.assertEqual(proc_ok.stdout, "已导出 2 行数据：%s\n" % out)
+        self._assert_recovery_page(out)
+        # 恢复后再次只读重读源库：结构与全部记录仍与初始状态一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+
+    # -- 命令行 --sql-file：失败后同一输出路径恢复成功 ---------------------
+
+    def test_cli_sql_file_overflow_then_recovery_same_path_exports_two_rows(self):
+        # 两个查询文件均为 UTF-8 文本，记录原始字节供用后核对
+        overflow_path = os.path.join(self.tmpdir, "失败查询.sql")
+        overflow_payload = OVERFLOW_SQL.encode("utf-8")
+        with open(overflow_path, "wb") as f:
+            f.write(overflow_payload)
+        recovery_path = os.path.join(self.tmpdir, "恢复查询.sql")
+        recovery_payload = RECOVERY_SQL.encode("utf-8")
+        with open(recovery_path, "wb") as f:
+            f.write(recovery_payload)
+        out = os.path.join(self.tmpdir, "cli_file_overflow.html")
+        self.assertFalse(os.path.exists(out))
+
+        proc_fail = self._run_cli(out, sql_file=overflow_path)
+        self._assert_cli_overflow_failure(proc_fail, out)
+        # 失败后只读重读源库：结构与全部记录与初始状态一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        # 失败查询文件只被读取，原始字节未变
+        with open(overflow_path, "rb") as f:
+            self.assertEqual(f.read(), overflow_payload)
+
+        proc_ok = self._run_cli(out, sql_file=recovery_path)
+        self.assertEqual(proc_ok.returncode, 0, proc_ok.stderr)
+        self.assertEqual(proc_ok.stderr, "")
+        # 标准输出只含一行现有格式的成功提示：数据行数 2 与目标路径
+        self.assertEqual(proc_ok.stdout, "已导出 2 行数据：%s\n" % out)
+        self._assert_recovery_page(out)
+        # 恢复后再次只读重读源库：结构与全部记录仍与初始状态一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        # 两个查询文件都只被读取，原始字节均未变
+        with open(overflow_path, "rb") as f:
+            self.assertEqual(f.read(), overflow_payload)
+        with open(recovery_path, "rb") as f:
+            self.assertEqual(f.read(), recovery_payload)
+
+
 class SqlFileTestCase(unittest.TestCase):
     """--sql-file 文件入口的回归测试：与 --sql 同规则、同结果。
 
