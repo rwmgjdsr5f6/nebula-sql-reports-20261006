@@ -383,12 +383,17 @@ def open_readonly(db_path):
     return conn
 
 
-def _execute_query(db_path, sql_text, output_path, params, null_text):
-    """校验全部输入并以只读方式执行查询，返回 (列名列表, 数据行列表)。
+def _prepare_statement(sql_text, params, null_text):
+    """汇集三个公开入口共用的输入校验，返回 (可执行语句文本, 绑定字典或 None)。
 
-    汇集 export_csv 与 export_html 共用的拒绝路径：null_text 类型、参数
-    字典、SQL 文本、占位符绑定、输出目录与目标占用、源库打开、查询执行与
-    结果求值。任何失败都抛 ValueError，且此时尚未创建输出文件。
+    空值标记类型、参数字典、SQL 文本与占位符绑定这四步规则原先在
+    export_csv/export_html 与 preview_csv 中各维护一份，现集中在此：
+    null_text 必须是字符串；params 为 None 或 名称->文本 的合法字典，
+    值一律按文本绑定；SQL 必须恰为一条 SELECT；位置占位符与缺少查询
+    引用的参数拒绝，未被引用的合法参数忽略。任一失败抛 ValueError，
+    报告顺序固定为 空值标记类型、参数字典、SQL、占位符。各入口的专属
+    校验（预览行数、HTML 说明类型）与文件导出的输出目标预查不在此列，
+    由调用方按各自既有顺序安排在本函数之前或之后。
     """
     if not isinstance(null_text, str):
         raise ValueError(
@@ -397,19 +402,37 @@ def _execute_query(db_path, sql_text, output_path, params, null_text):
     params = validate_params(params)
     statement = validate_single_select(sql_text)
     bound = bind_params(statement, params)
+    return statement, bound
 
+
+def _ensure_output_available(output_path):
+    """文件导出的目标预查：输出目录必须存在、目标必须尚未被占用。
+
+    在打开源库之前完成：目录缺失或目标已存在时绝不接触源库，也不会
+    打开输出文件；既存文件的原字节随后另由独占新建写入保证不被覆盖。
+    """
     output_dir = os.path.dirname(os.path.abspath(output_path))
     if not os.path.isdir(output_dir):
         raise ValueError("输出目录不存在：%s" % output_dir)
     if os.path.exists(output_path):
         raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
 
+
+def _run_readonly(db_path, statement, bound):
+    """以只读方式打开源库执行已校验语句并完整取回结果，返回 (列名列表, 行列表)。
+
+    export_csv、export_html 与 preview_csv 共用同一份"打开只读连接 →
+    执行并完整求值 → 关闭连接"流程：无论成功或失败，返回前连接都已
+    释放。源库缺失或损坏在打开阶段抛 ValueError（只读 URI 绝不会创建
+    新库）；execute 与 fetchall 阶段的 sqlite3.Error 由 _fetch_rows
+    统一归类为 ValueError。调用方保证在本函数成功返回前尚未产生任何
+    输出，因此部分结果即使已可用也不会被当作成功写出。
+    """
     conn = open_readonly(db_path)
     try:
-        headers, rows = _fetch_rows(conn, statement, bound)
+        return _fetch_rows(conn, statement, bound)
     finally:
         conn.close()
-    return headers, rows
 
 
 def _fetch_rows(conn, statement, bound):
@@ -490,9 +513,11 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     标记不影响列名、列顺序、行顺序、非空值与数据行数，源数据中的空字符串
     仍写为空字段。
     """
-    headers, rows = _execute_query(
-        db_path, sql_text, output_path, params, null_text
-    )
+    # 三个入口共用同一份查询准备：空值标记类型、参数字典、SQL 与占位符
+    statement, bound = _prepare_statement(sql_text, params, null_text)
+    # 输入校验通过后先预查输出目录与目标占用，再以只读方式打开源库
+    _ensure_output_available(output_path)
+    headers, rows = _run_readonly(db_path, statement, bound)
 
     _write_output_file(
         output_path, lambda f: _write_csv_records(f, headers, rows, null_text)
@@ -504,10 +529,11 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
 def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
     """执行查询并把前 limit 行以带列名的 CSV 写到标准输出，返回写出的数据行数。
 
-    与 export_csv 共用全部校验与拒绝路径（null_text 类型、参数字典、SQL
-    文本、占位符绑定、源库打开、查询执行与结果求值），任何失败都抛
-    ValueError 且此时标准输出尚未写入任何内容，不会留下部分预览。预览
-    不创建报告或临时文件，源库与查询文件保持不变。
+    与 export_csv、export_html 共用全部输入校验与只读取数流程（空值
+    标记类型、参数字典、SQL 文本、占位符绑定、源库打开、查询执行与结果
+    求值），任何失败都抛 ValueError 且此时标准输出尚未写入任何内容，
+    不会留下部分预览。预览不创建报告或临时文件，源库与查询文件保持
+    不变。
 
     limit 为正整数：表头始终输出，数据行最多 limit 条；结果不足 limit
     条时全部显示，零行结果只显示表头。列名、列顺序与查询返回的行顺序
@@ -515,21 +541,11 @@ def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
     null_text（默认空字段），非空值不额外替换；中文、逗号、引号及换行
     由 _write_csv_records 按与文件导出完全相同的 CSV 规则写出。
     """
+    # 行数是预览入口的专属校验，仍最先拒绝；之后共用同一份查询准备
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("preview 行数必须是正整数，收到 %r" % (limit,))
-    if not isinstance(null_text, str):
-        raise ValueError(
-            "null_text 必须是字符串，收到 %s" % type(null_text).__name__
-        )
-    params = validate_params(params)
-    statement = validate_single_select(sql_text)
-    bound = bind_params(statement, params)
-
-    conn = open_readonly(db_path)
-    try:
-        headers, rows = _fetch_rows(conn, statement, bound)
-    finally:
-        conn.close()
+    statement, bound = _prepare_statement(sql_text, params, null_text)
+    headers, rows = _run_readonly(db_path, statement, bound)
 
     # 全部结果求值成功后才开始写标准输出：失败路径不会留下部分预览
     shown = rows[:limit]
@@ -607,13 +623,16 @@ def export_html(db_path, sql_text, output_path, params=None, null_text="",
     HTML 特殊字符按文字转义。必须是字符串，非字符串值抛 ValueError 且
     不创建输出文件；省略或传入空字符串时，输出与未提供说明逐字节一致。
     """
+    # 说明类型是 HTML 入口的专属校验，仍最先报告；之后与另外两个入口
+    # 共用同一份查询准备（空值标记类型、参数字典、SQL、占位符）
     if not isinstance(description, str):
         raise ValueError(
             "description 必须是字符串，收到 %s" % type(description).__name__
         )
-    headers, rows = _execute_query(
-        db_path, sql_text, output_path, params, null_text
-    )
+    statement, bound = _prepare_statement(sql_text, params, null_text)
+    # 输入校验通过后先预查输出目录与目标占用，再以只读方式打开源库
+    _ensure_output_available(output_path)
+    headers, rows = _run_readonly(db_path, statement, bound)
     page = render_html(headers, rows, null_text, description)
 
     _write_output_file(output_path, lambda f: f.write(page))
