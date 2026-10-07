@@ -383,12 +383,14 @@ def open_readonly(db_path):
     return conn
 
 
-def _execute_query(db_path, sql_text, output_path, params, null_text):
-    """校验全部输入并以只读方式执行查询，返回 (列名列表, 数据行列表)。
+def _prepare_query(sql_text, params, null_text):
+    """校验三类入口共用的查询输入，返回 (可执行语句, 绑定字典)。
 
-    汇集 export_csv 与 export_html 共用的拒绝路径：null_text 类型、参数
-    字典、SQL 文本、占位符绑定、输出目录与目标占用、源库打开、查询执行与
-    结果求值。任何失败都抛 ValueError，且此时尚未创建输出文件。
+    集中 export_csv、export_html 与 preview_csv 同一份拒绝规则及先后
+    顺序：null_text 类型 → 参数字典 → 单条 SELECT → 占位符绑定。任何
+    失败都抛 ValueError；此阶段只做纯输入校验，不检查输出目标，也不
+    打开源库。preview_csv 特有的行数校验、export_html 特有的说明类型
+    校验由调用方在本函数之前先行完成，因此三者的错误优先级保持原状。
     """
     if not isinstance(null_text, str):
         raise ValueError(
@@ -397,6 +399,18 @@ def _execute_query(db_path, sql_text, output_path, params, null_text):
     params = validate_params(params)
     statement = validate_single_select(sql_text)
     bound = bind_params(statement, params)
+    return statement, bound
+
+
+def _execute_query(db_path, sql_text, output_path, params, null_text):
+    """文件导出共用的查询准备与只读取数，返回 (列名列表, 数据行列表)。
+
+    输入校验与 preview_csv 走同一份 _prepare_query；输出目录与目标占用
+    是文件导出独有的预检，且必须在打开源库之前完成。随后与预览共用
+    _run_readonly_query 完成只读取数。任何失败都抛 ValueError，且此时
+    尚未创建输出文件。
+    """
+    statement, bound = _prepare_query(sql_text, params, null_text)
 
     output_dir = os.path.dirname(os.path.abspath(output_path))
     if not os.path.isdir(output_dir):
@@ -404,12 +418,7 @@ def _execute_query(db_path, sql_text, output_path, params, null_text):
     if os.path.exists(output_path):
         raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
 
-    conn = open_readonly(db_path)
-    try:
-        headers, rows = _fetch_rows(conn, statement, bound)
-    finally:
-        conn.close()
-    return headers, rows
+    return _run_readonly_query(db_path, statement, bound)
 
 
 def _fetch_rows(conn, statement, bound):
@@ -436,6 +445,21 @@ def _fetch_rows(conn, statement, bound):
     except sqlite3.Error as exc:
         raise ValueError("SQL 执行失败：%s" % exc)
     return headers, rows
+
+
+def _run_readonly_query(db_path, statement, bound):
+    """以只读连接打开源库、取回全部结果，并保证随后关闭连接。
+
+    三类入口共用同一份只读取数流程：open_readonly 负责在文件缺失或
+    损坏时抛 ValueError 且不创建新库；_fetch_rows 统一开始执行与惰性
+    求值两个时点的 sqlite3.Error 为 ValueError。连接在 try/finally
+    中关闭，成功或失败都不会遗留在手的数据库连接。
+    """
+    conn = open_readonly(db_path)
+    try:
+        return _fetch_rows(conn, statement, bound)
+    finally:
+        conn.close()
 
 
 def _write_output_file(output_path, write_content):
@@ -504,34 +528,29 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
 def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
     """执行查询并把前 limit 行以带列名的 CSV 写到标准输出，返回写出的数据行数。
 
-    与 export_csv 共用全部校验与拒绝路径（null_text 类型、参数字典、SQL
-    文本、占位符绑定、源库打开、查询执行与结果求值），任何失败都抛
-    ValueError 且此时标准输出尚未写入任何内容，不会留下部分预览。预览
-    不创建报告或临时文件，源库与查询文件保持不变。
+    与 export_csv、export_html 共用全部查询准备与只读取数流程
+    （_prepare_query 统一 null_text 类型、参数字典、SQL 文本与占位符
+    绑定的校验，_run_readonly_query 统一源库打开、查询执行、结果求值
+    与连接关闭）：任何失败都抛 ValueError 且此时标准输出尚未写入任何
+    内容，不会留下部分预览。预览不创建报告或临时文件，源库与查询
+    文件保持不变。
 
-    limit 为正整数：表头始终输出，数据行最多 limit 条；结果不足 limit
-    条时全部显示，零行结果只显示表头。列名、列顺序与查询返回的行顺序
-    保持一致，查询的筛选、排序和 LIMIT 语义原样保留。SQL NULL 写
-    null_text（默认空字段），非空值不额外替换；中文、逗号、引号及换行
-    由 _write_csv_records 按与文件导出完全相同的 CSV 规则写出。
+    limit 为正整数：该入口特有的行数校验先于共用准备执行，因此行数
+    非法时不再继续报告 null_text、参数或 SQL 的问题。表头始终输出，
+    数据行最多 limit 条；结果不足 limit 条时全部显示，零行结果只显示
+    表头。列名、列顺序与查询返回的行顺序保持一致，查询的筛选、排序
+    和 LIMIT 语义原样保留。SQL NULL 写 null_text（默认空字段），非空
+    值不额外替换；中文、逗号、引号及换行由 _write_csv_records 按与
+    文件导出完全相同的 CSV 规则写出。
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("preview 行数必须是正整数，收到 %r" % (limit,))
-    if not isinstance(null_text, str):
-        raise ValueError(
-            "null_text 必须是字符串，收到 %s" % type(null_text).__name__
-        )
-    params = validate_params(params)
-    statement = validate_single_select(sql_text)
-    bound = bind_params(statement, params)
+    statement, bound = _prepare_query(sql_text, params, null_text)
 
-    conn = open_readonly(db_path)
-    try:
-        headers, rows = _fetch_rows(conn, statement, bound)
-    finally:
-        conn.close()
+    # 全部结果经共享流程求值成功、连接随即关闭后，才开始写标准输出：
+    # 失败路径不会留下部分预览，也不会遗留已打开的数据库连接
+    headers, rows = _run_readonly_query(db_path, statement, bound)
 
-    # 全部结果求值成功后才开始写标准输出：失败路径不会留下部分预览
     shown = rows[:limit]
     _write_csv_records(sys.stdout, headers, shown, null_text)
     return len(shown)
