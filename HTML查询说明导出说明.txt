@@ -1,0 +1,413 @@
+HTML 查询说明导出说明：从 query.sql 的 :who 到带说明的 HTML 报告
+==============================================================
+
+- 编写日期：2026-10-07
+- 适用源码：当前目录下的 report.py、query.sql、test_report.py（工作区唯一
+  提交 a016afd）
+- 文档性质：
+  1. 本文全部行为结论按当前 report.py 源码静态推导，括注的“源码位置”
+     均指向当前 report.py 的行号，query.sql 引述指向当前 query.sql 的
+     行号；不沿用《参数查询导出说明.txt》《源码核对说明.md》中的历史
+     行号（两份既有说明写成时对应的代码位置与当前不同）。
+  2. 凡写“现有断言”之处，指 test_report.py 中已经写出的断言（给出
+     行号区间），它们是依据而非实测记录；本文未运行 python -m
+     unittest，也未手工执行下面任何一条示例命令。示例的输出一律标注
+     为“按源码推导的预期”，不称为实测。
+  3. 本次交付仅新增本文档；产品代码 report.py、测试 test_report.py、
+     README.md、query.sql 与两份既有说明均保持原状，不新增任何导出
+     选项或命令行参数。
+
+
+一、样例库与 query.sql
+----------------------
+
+本文样例沿用 test_report.py 中 people/notes 合成库（建表与插数见
+test_report.py:59-81；说明专用测试类在 2634-2655 重复了同一准备
+逻辑）：
+
+    people(id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+    notes(person_id INTEGER PRIMARY KEY, note TEXT)
+
+两条记录（test_report.py:70-78、2645-2652）：
+
+    people: (1, '小明')、(2, '小红')
+    notes:  (1, NULL)、(2, '中文,含"引号"')   -- NOTE_VALUE 常量见
+                                               -- test_report.py:33
+
+关联条件为 people p JOIN notes n ON p.id = n.person_id：小明的备注
+是 SQL NULL（Python 端为 None），小红的备注是同时含中文、逗号与双
+引号的文本。仓库本身不随附 sample.sqlite——.gitignore 第 6 行忽略
+*.sqlite，下例假设你已按上述结构自行准备好该文件。
+
+当前 query.sql 全文 4 行（query.sql:1-4），结尾分号后有一个换行：
+
+    第 1 行  SELECT p.name AS 姓名, n.note AS 备注
+    第 2 行  FROM people p JOIN notes n ON p.id = n.person_id
+    第 3 行  WHERE p.name = :who
+    第 4 行  ORDER BY p.id;
+
+:who（query.sql:3）是唯一的命名参数占位符。首尾空白与单个结尾分号
+属于允许形态（validate_single_select，report.py:191-226）。
+
+
+二、公开入口与一条完整命令
+--------------------------
+
+两个公开入口：命令行 main（report.py:638-673）与库函数 export_html
+（report.py:524-556）。函数入口接收 SQL 文本而非文件路径，故使用
+query.sql 时需先经 read_sql_file（report.py:338-357）取文本——
+main 在 report.py:644 正是这样做的。
+
+完整命令（在含 sample.sqlite 与 query.sql 的目录执行；--format
+显式选择 html，who=小明，空值标记“未填写”，查询说明“筛选小明”）：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --format html --param who=小明 --null-text 未填写 \
+        --description 筛选小明 --output report.html
+
+等价的函数调用（先 read_sql_file，再 export_html）：
+
+    import report
+
+    sql_text = report.read_sql_file("query.sql")
+    count = report.export_html(
+        "sample.sqlite", sql_text, "report.html",
+        params={"who": "小明"},
+        null_text="未填写",
+        description="筛选小明",
+    )
+    # count == 1
+
+2.1 一次调用的实际先后顺序（任一步抛异常，其后步骤都不执行）
+
+  顺序  步骤                                              源码位置
+  ----  ------------------------------------------------  ----------------
+   1    输入解析 parse_args：--db/--output 必填；          report.py:590-635
+        --sql 与 --sql-file 恰好选一个（626-627）；        （main 调用 639）
+        --format 仅 csv/html、默认 csv（600-605）；
+        --param 由 parse_param_options 在第一个等号
+        处拆成名称/文本值（567-587，调用点 634）；
+        --null-text 默认 ""（612-617）；--description
+        默认 None（618-623），显式提供且格式非 html
+        时在此拒绝（630-633，见第五节失败示例二）。
+        此步发生在读查询文件之前。
+   2    读取查询文件（仅 --sql-file）：二进制读入后        read_sql_file
+        以 utf-8-sig 解码（仅剥除开头恰一个 BOM，355）；  report.py:338-357
+        文件不存在、是目录、不可读、非 UTF-8 均抛          （main 641-646）
+        ValueError 并交 die。文件只被读取，绝不改写。
+   3    进入 export_html，先核对 description 必须是         report.py:545-548
+        字符串（失败示例一）；此步在执行查询、打开
+        源库与创建输出文件之前。
+   4    进入 _execute_query（376-420），依次：
+        4a  null_text 必须是字符串                         383-386
+        4b  参数字典校验：None 放行；否则须 str->str       387、249-267
+        4c  单条 SELECT 白名单校验，返回可执行语句         388、191-226
+        4d  参数绑定核对：:who 必须由 params 提供；        389、314-335
+            值只作为绑定数据交给 cursor.execute，
+            绝不拼入 SQL 文本（401-404）
+        4e  输出目录必须存在；输出目标必须不存在（预查）   391-395
+            （失败示例三）
+        4f  以只读 URI（file:...?mode=ro）打开源库，       397、360-373
+            并查 sqlite_master 强制解析文件头；库
+            缺失不会创建
+        4g  执行查询并取 cursor.description 的列名         399-409
+        4h  fetchall 取完全部结果行（惰性求值期错误       414-417
+            同样包装为 ValueError）
+        4i  finally 关闭连接（异常时也关闭）               418-419
+   5    渲染页面 render_html：在连接关闭之后于内存中       report.py:552、
+        拼接整页文本。description 只在此处被使用           475-521
+        （552），它不是 _execute_query 的实参（549-551），
+        因此说明文本不参与 SQL，也不进入绑定。
+   6    报告写入：以独占新建模式 "x" 打开目标，            report.py:554、
+        UTF-8、newline=""，整页一次 write；目标已          423-442
+        存在由 FileExistsError 拒绝（434-435），其他
+        写入错误只清理本调用刚建的半成品（436-442）。
+   7    export_html 返回数据行数 len(rows)：不含表头，     report.py:556
+        也不含说明区域。
+   8    main 打印一行成功信息并 return 0；ValueError       report.py:672-673、
+        交 die：标准错误输出“错误: …”、退出码 1、         666-667、57-60
+        不打印成功信息。
+
+即用户要求核对的顺序“输入解析 → 查询文件读取 → 参数绑定 → 只读查库
+→ 取完结果 → 关闭连接 → 报告写入”与源码一致：1 → 2 → 4d → 4f-4h →
+4i → 6；说明文本到第 5 步才出现，不经过第 4 步的任何数据库环节。
+
+2.2 成功时的预期结果（按源码推导，非实测）
+
+- 函数返回值：1（len(rows)，report.py:556）。
+- 命令退出码：0（main return 0，report.py:673；__main__ 以
+  sys.exit(main()) 结束，report.py:677）。
+- 标准输出恰为一行（report.py:672 的格式串加 print 自带换行）：
+
+      已导出 1 行数据：report.html
+
+- 标准错误为空（成功路径不向 stderr 写内容）。
+- 页面关键内容：浏览器标题与页面主标题均为“查询报告”
+  （report.py:491、499）；查询说明“筛选小明”位于主标题之后、
+  结果表格之前的独立区域（501-506）；表头依次为“姓名”“备注”
+  （510，列名来自 cursor.description，409）；唯一数据行为
+  “小明”“未填写”——WHERE 只命中 id=1（绑定值经 401-404 传入），
+  其 NULL 备注在渲染时替换为 null_text（516），小红一行被过滤。
+
+按 render_html（report.py:486-521）逐行构造的 report.html 预期
+全文如下（UTF-8；最后一行后的换行来自 520 行末尾的 "" 经 521 行
+"\n".join 产生的收尾换行）：
+
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+    <meta charset="utf-8">
+    <title>查询报告</title>
+    <style>
+    table{border-collapse:collapse}
+    th,td{border:1px solid #999;padding:4px 8px;white-space:pre-wrap;text-align:left;vertical-align:top}
+    </style>
+    </head>
+    <body>
+    <h1>查询报告</h1>
+    <p style="white-space:pre-wrap">筛选小明</p>
+    <table>
+    <thead>
+    <tr><th>姓名</th><th>备注</th></tr>
+    </thead>
+    <tbody>
+    <tr><td>小明</td><td>未填写</td></tr>
+    </tbody>
+    </table>
+    </body>
+    </html>
+
+对应关系：DOCTYPE/编码声明/标题 487-491；固定样式表 492-496；
+<h1> 499；说明区域仅当 description != "" 时追加（501-506）；
+<table>... 骨架 507-513；数据行循环 514-519，NULL 替换表达式
+`null_text if value is None else str(value)` 在 516；收尾与换行
+520-521。
+
+现有断言（均为测试中已写出的断言，非执行记录）：
+- 函数入口同构组合（people/notes、who=小明、标记“未填写”、说明
+  文本、返回 1、表格恰为表头加一行“小明/未填写”、说明在标题后
+  表格前、浏览器标题不含说明）：test_report.py:2708-2737；所用
+  常量 DESC_SQL/DESC_MARKER/DESC_TEXT/期望表在 2592-2611。
+- 命令行 --sql-file + --description 的成功组合：2846-2861；
+  --sql + --description：2836-2844；公共成功断言（退出码 0、
+  stderr == ""、stdout 精确等于“已导出 1 行数据：<路径>\n”）
+  在 2826-2834。
+- 说明：上述用例使用内联 DESC_SQL（2592-2596）与临时查询文件，
+  SQL 文本与仓库 query.sql:1-4 逐字等价；现有测试没有直接引用
+  仓库中的 query.sql 文件本身。HTML 页面骨架与五种特殊字符转义
+  的通用断言（items 表夹具）在 2141-2149、2186-2203。
+
+
+三、who 改为不存在：返回 0，只剩表头，说明仍在
+------------------------------------------------
+
+只把参数值换掉，其余不变：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --format html --param who=不存在 --null-text 未填写 \
+        --description 筛选小明 --output miss.html
+
+函数入口等价于 params={"who": "不存在"} 调用 export_html。
+
+按源码推导的预期：
+
+1. “不存在”按文本绑定（report.py:401-404），WHERE 不命中，
+   fetchall 得到空列表（415）；export_html 返回 len(rows) == 0
+   （556），命令退出码 0，标准输出为“已导出 0 行数据：
+   miss.html”（672），标准错误为空。
+2. 表头在数据循环之前无条件渲染（report.py:507-513），数据行
+   循环（514-519）一次都不执行，故表格只保留表头：
+
+       <table>
+       <thead>
+       <tr><th>姓名</th><th>备注</th></tr>
+       </thead>
+       <tbody>
+       </tbody>
+       </table>
+
+3. 说明区域只取决于 description 是否为空字符串（report.py:501），
+   与数据行数无关，故 <p style="white-space:pre-wrap">筛选小明
+   </p> 仍位于主标题与表格之间。说明从不计入数据行——行数唯一
+   来源是 len(rows)（556）。
+
+现有断言：函数入口零行时返回 0、表格只有“姓名/备注”表头、说明
+转义文本仍在说明区（test_report.py:2778-2789）；命令行
+--sql-file 同构用例（退出码 0、stdout 为“已导出 0 行数据…”、
+仅表头、说明仍在）2863-2878。
+
+
+四、说明区域的规则（省略/空串/空白/中文/转义）
+------------------------------------------------
+
+1. 有无区域的唯一判据是 description != ""（report.py:501）。
+   非空时在 <h1>（499）与 <table>（507）之间追加恰好一行
+   `<p style="white-space:pre-wrap">…</p>`（504-506）。
+2. 省略说明与传入空字符串：没有说明区域，且两种输出逐字节一致。
+   - 函数入口：省略时取默认值 description=""（形参默认在 525）；
+     显式传 "" 同样在 501 判为不追加。两条路径渲染输入完全相同。
+   - 命令行：未提供 --description 时 argparse 给出 None
+     （report.py:621），main 以 `description=args.description or
+     ""` 归一为 ""（664）；显式 `--description ""` 直接得到 ""。
+   - 现有断言：两次调用产物二进制逐字节相等、省略时标题与表格
+     之间的片段恰为 "\n"（test_report.py:2754-2774，字节比较
+     2767-2770）。
+3. 只有空白的非空说明（如 "  \n\t  "）仍产生独立区域：501 的
+   判定不做 strip。现有断言 test_report.py:2739-2750。
+4. 中文、首尾空格、连续空格与换行完整保留：说明文本经
+   html.escape 转义但空白不删改（report.py:505），<p> 上的
+   white-space:pre-wrap 令浏览器保留空白与换行；文件中新line
+   字符本身原样存在。单元格也有同样的 pre-wrap 样式（494-495）。
+   现有断言（两字首空格、连续两空格、换行均在转义文本中）
+   test_report.py:2730-2733。
+5. HTML 特殊字符按文字转义，不产生标签：说明经 html.escape
+   （report.py:505，默认 quote=True），&、<、>、双引号、单引号
+   分别写为 &amp;、&lt;、&gt;、&quot;、&#x27;；`<script>` 形态
+   只显示为文字，页面中不存在该标签。现有断言：说明区含
+   &lt;script&gt;、整页不含 "<script"、说明原始文本不出现
+   （test_report.py:2734-2737）。表头（510）与数据单元格（516）
+   适用同一转义：小红的备注若被选中，页面上呈现
+   `中文,含&quot;引号&quot;`（逗号不是 HTML 特殊字符）；五种
+   转义形态的通用断言见 2196-2203。
+6. 说明不进入浏览器标题（<title> 固定为“查询报告”，
+   report.py:491）、表头、数据行，也不进入 SQL：它只在渲染时
+   作为参数传给 render_html（552），_execute_query 的调用
+   （549-551）与函数签名（376）中都没有它。现有断言：标题不含
+   说明、表格仍为原结果（test_report.py:2722-2725）；行数恒为
+   数据行数（2720、2747、2765-2766）。
+
+
+五、失败示例（仅覆盖以下三种）
+------------------------------
+
+三种失败共同约定：不创建新报告；若输出路径上已有文件，其字节
+保持不变（各用例的具体保证见下）。
+
+5.1 函数入口传入 description=None（ValueError）
+
+    report.export_html(
+        "sample.sqlite", sql_text, "bad.html",
+        params={"who": "小明"}, description=None,
+    )
+
+export_html 的第一步类型检查即失败：None 不是 str，抛
+ValueError("description 必须是字符串，收到 NoneType")
+（report.py:545-548，类型名取 type(None).__name__）。该步在
+_execute_query 调用（549）之前：不校验其余参数、不打开源库、
+不渲染、不创建 bad.html。
+
+现有断言：对 (None, 1, True, ["说明"]) 四值均
+assertRaises(ValueError) 且目标路径不存在（test_report.py:
+2793-2804）；断言只检查异常类型与无文件，错误信息逐字文本按
+report.py:546-548 推导。
+
+5.2 命令行把 --description 与 CSV 格式搭配（退出码 1）
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --format csv --param who=小明 \
+        --description 筛选小明 --output x.csv
+
+按源码推导：parse_args 中 args.description 非 None 且
+args.format != "html"，调用 parser.error（report.py:630-633）；
+自定义 _Parser.error 先 print_usage(sys.stderr)（563）再经 die
+输出一行“错误: 参数错误：--description 仅支持 --format html：
+CSV 报告不包含查询说明文本”（564、59、631-632），sys.exit(1)
+（60）。拒绝发生在 parse_args 内（639），早于读取查询文件
+（644）与任何导出动作，故不读文件、不开库、不建 x.csv。
+
+预期：退出码 1；标准错误含用法行及上述原因（含“错误: ”、
+“--description”、“html”）；标准输出为空；不创建新报告，输出
+路径上若已有文件则字节不变。
+
+现有断言：显式 csv 用例 test_report.py:2894-2898，公共断言
+2882-2892（退出码 1、stderr 包含性检查、stdout == ""、目标
+不存在）；同目录预置文件字节不变的用例 2914-2926（断言退出码
+1、stdout 为空与字节相等，未逐字断言 stderr）。标准错误的
+完整逐字文本按 report.py:562-564、631-632 推导。
+
+5.3 命令行使用已存在的输出目标（退出码 1）
+
+先向 report.html 写入任意字节，再执行第二节的成功命令。
+
+按源码推导：参数解析（顺序 1）与查询文件读取（顺序 2）正常；
+export_html 的 description 类型检查通过（545-548），进入
+_execute_query 后，null_text、参数、SQL、绑定（383-389）依次
+通过，输出目录存在，随后 os.path.exists(output_path) 为真，
+抛 ValueError("输出目标已存在，拒绝覆盖：report.html")
+（report.py:394-395）。此步在 open_readonly（397）之前，渲染
+（552）与写入（554）均不可达；main 捕获后交 die（666-667）。
+
+预期：退出码 1；标准错误为“错误: 输出目标已存在，拒绝覆盖：
+report.html”（“错误: ”前缀在 report.py:59，路径与措辞在 395）；
+标准输出为空（672 不可达）；既有文件字节逐字不变，不产生新
+报告。即便绕过预查发生竞态，写入端 "x" 独占新建与
+FileExistsError 分支同样拒绝（432、434-435），既存文件不可能
+被截断。
+
+现有断言：带 --description 的 HTML 命令行用例（退出码 1、
+stderr 含“错误: ”与“已存在”、stdout 为空、原字节相等）
+test_report.py:2958-2973；函数入口同构用例 2808-2822；不带
+说明的 HTML 命令行同类断言 2308-2322。
+
+
+六、源码位置与现有断言速查
+--------------------------
+
+行为                                      源码位置          现有断言
+----------------------------------------------------------------------
+--description 选项定义、默认 None         report.py:618-623 2930-2954
+description 仅允许 html（csv 拒绝）       report.py:630-633 2882-2912、
+                                                                  2914-2926
+未提供 --description 归一为 ""            report.py:664      2754-2774
+export_html 的 description 形参默认 ""    report.py:524-525 2754-2774
+description 非字符串拒绝且不建文件        report.py:545-548 2793-2804
+说明区域位置（h1 后、table 前）           report.py:499-507 2685-2689、
+                                                                  2727-2729
+省略/空串无区域且逐字节一致               report.py:501、525 2754-2774
+纯空白非空说明仍有独立区域                report.py:501      2739-2750
+中文/空格/换行保留（pre-wrap）            report.py:505、    2730-2733
+                                          494-495
+五种特殊字符转义、不产生标签              report.py:505、    2734-2737、
+                                          510、516           2196-2203
+说明不参与 SQL、不进标题/表头/数据行      report.py:549-552 2722-2725
+NULL 单元格渲染为 null_text               report.py:514-519 2708-2723、
+                                                                  2215-2238
+零行仅表头、说明仍在、返回 0              report.py:507-519、2778-2789、
+                                          556                2863-2878
+成功：返回 1、退出码 0、stdout 一行       report.py:556、    2719-2720、
+                                          672-673            2826-2834、
+                                                                  2846-2861
+目标已存在拒绝（预查 + "x" 双保险）       report.py:394-395、2808-2822、
+                                          432、434-435       2958-2973、
+                                                                  2308-2322
+失败统一：退出码 1、stderr“错误: …”、     report.py:57-60、  2882-2892、
+      stdout 为空、不建新文件             666-667            2958-2973
+查询文件 UTF-8/单 BOM、只读不改写         report.py:338-357  2846-2861
+源库以 ?mode=ro 只读打开、缺失不创建      report.py:360-373  2630-2632、
+                                                                  2657-2673
+执行后取完结果、finally 关闭连接          report.py:399-420  2060-2091
+
+表中“现有断言”列为 test_report.py 行号，仅表示测试已经写出
+对应断言；本文未运行测试，第二、三、五节中的命令行输出与页面
+全文均属按当前源码逐项构造的预期，不是实测记录。
+
+
+七、范围与未改动项
+------------------
+
+1. 本文只补充“读取 query.sql → 绑定 :who → 只读执行 SELECT →
+   渲染带查询说明的 HTML → 独占写报告 → 返回数据行数”这一条
+   HTML 查询说明导出流程的源码核对；既有《参数查询导出说明.txt》
+   覆盖的 CSV 路径不在本文重复展开，CSV 导出行为维持原状
+   （export_csv，report.py:445-472，未被本次交付修改）。
+2. 源库只读行为维持原状：open_readonly 以 file URI 加 ?mode=ro
+   打开并以 sqlite_master 探活（report.py:360-373），说明文本
+   不经过任何数据库环节（549-552）。
+3. 不新增导出选项或参数：--description 的既有规则（仅 html、
+   None/空字符串/纯空白语义、转义与保留规则）以当前源码为准
+   记录，不做任何行为变更。
+4. 本次交付仅新增本文档（HTML查询说明导出说明.txt）；report.py、
+   test_report.py、README.md、query.sql、两份既有说明、
+   result.csv、result2.csv 均保持原状（result.csv、result2.csv
+   不被源码或测试引用，本文示例不以其为依据）；样例库
+   sample.sqlite 不是仓库文件，需按第一节结构自行准备。
