@@ -34,6 +34,14 @@ SQL 文本。字符串与注释中的类似文本不算参数；未被查询引�
 查询结果一致；零行结果仍保留表头。单元格文本中的 &、<、>、双引号与
 单引号按 HTML 转义为文字显示，不产生额外标签或脚本；中文、首尾空格与
 换行完整保留。页面不依赖任何外部资源，直接打开即可查看。
+
+--description TEXT 为 HTML 报告附加一段纯文本查询说明（如筛选口径），
+显示在主标题之后、结果表格之前的独立文本区域；说明不进入表头、数据行、
+浏览器标题或 SQL，也不改变数据行数。说明中的中文、首尾空格、连续空格与
+换行在页面中保留，&、<、>、双引号与单引号按文字转义，类似 <script>
+的内容只显示为文字。该选项仅与 --format html 搭配使用；显式提供
+--description（即使为空）而选择 csv 或省略格式时按参数错误拒绝。
+省略说明或传入空字符串时，HTML 输出与未提供说明时逐字节一致。
 """
 
 import argparse
@@ -464,11 +472,16 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     return len(rows)
 
 
-def render_html(headers, rows, null_text):
+def render_html(headers, rows, null_text, description=""):
     """把查询结果渲染为独立 HTML 页面文本（UTF-8，不依赖外部资源）。
 
     列名与单元格文本中的 &、<、>、双引号、单引号一律转义为字符引用，
     只作为文字显示；NULL 单元格显示 null_text，其余值按 str 转为文本。
+
+    description 为非空字符串时，在主标题之后、结果表格之前输出一个独立
+    文本区域：说明同样按文字转义，并以 white-space:pre-wrap 保留中文、
+    首尾空格、连续空格与换行；空字符串（默认）不输出该区域，页面与未
+    提供说明时逐字节一致。
     """
     lines = [
         "<!DOCTYPE html>",
@@ -484,6 +497,14 @@ def render_html(headers, rows, null_text):
         "</head>",
         "<body>",
         "<h1>查询报告</h1>",
+    ]
+    if description != "":
+        # 独立文本区域：内联 pre-wrap 样式，使省略说明时样式表与页面其余
+        # 部分保持原有字节；说明只作为文字，转义后不产生标签或脚本
+        lines.append(
+            '<p style="white-space:pre-wrap">%s</p>' % html.escape(description)
+        )
+    lines += [
         "<table>",
         "<thead>",
         "<tr>" + "".join("<th>%s</th>" % html.escape(h) for h in headers) + "</tr>",
@@ -500,7 +521,8 @@ def render_html(headers, rows, null_text):
     return "\n".join(lines)
 
 
-def export_html(db_path, sql_text, output_path, params=None, null_text=""):
+def export_html(db_path, sql_text, output_path, params=None, null_text="",
+                description=""):
     """执行查询并将结果独占写入目标 HTML 报告，返回数据行数（不含表头）。
 
     输入与可选参数和 export_csv 完全相同，拒绝路径（源库缺失或无效、SQL
@@ -513,11 +535,21 @@ def export_html(db_path, sql_text, output_path, params=None, null_text=""):
     保留表头并返回 0。SQL NULL 显示 null_text（默认空单元格）；空字符串
     和与标记同形的普通文本不额外转换，其他值按 str 转为文本。文本中的
     HTML 特殊字符转义为文字显示，不产生额外标签或脚本。
+
+    description 为可选的纯文本查询说明：非空时显示在主标题之后、结果
+    表格之前的独立文本区域，不进入表头、数据行、浏览器标题或 SQL，也
+    不改变数据行数；说明中的中文、首尾空格、连续空格与换行完整保留，
+    HTML 特殊字符按文字转义。必须是字符串，非字符串值抛 ValueError 且
+    不创建输出文件；省略或传入空字符串时，输出与未提供说明逐字节一致。
     """
+    if not isinstance(description, str):
+        raise ValueError(
+            "description 必须是字符串，收到 %s" % type(description).__name__
+        )
     headers, rows = _execute_query(
         db_path, sql_text, output_path, params, null_text
     )
-    page = render_html(headers, rows, null_text)
+    page = render_html(headers, rows, null_text, description)
 
     _write_output_file(output_path, lambda f: f.write(page))
 
@@ -583,10 +615,22 @@ def parse_args(argv):
         default="",
         help="SQL NULL 在输出中的导出标记，默认为空；标记原样写入，可含空格、逗号、引号与换行",
     )
+    parser.add_argument(
+        "--description",
+        metavar="TEXT",
+        default=None,
+        help="HTML 报告主标题后的纯文本查询说明；仅与 --format html 搭配使用",
+    )
     args = parser.parse_args(argv)
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
         parser.error("--sql 与 --sql-file 必须恰好选择一个")
+    # 显式提供 --description（即使为空）时只允许 HTML 格式；
+    # 以 None 区分"未提供"与"提供空字符串"
+    if args.description is not None and args.format != "html":
+        parser.error(
+            "--description 仅支持 --format html：CSV 报告不包含查询说明文本"
+        )
     args.params = parse_param_options(args.param, parser)
     return args
 
@@ -600,15 +644,25 @@ def main(argv=None):
             sql_text = read_sql_file(args.sql_file)
         except ValueError as exc:
             die(str(exc))
-    exporter = export_csv if args.format == "csv" else export_html
     try:
-        row_count = exporter(
-            args.db,
-            sql_text,
-            args.output,
-            params=args.params,
-            null_text=args.null_text,
-        )
+        if args.format == "csv":
+            row_count = export_csv(
+                args.db,
+                sql_text,
+                args.output,
+                params=args.params,
+                null_text=args.null_text,
+            )
+        else:
+            row_count = export_html(
+                args.db,
+                sql_text,
+                args.output,
+                params=args.params,
+                null_text=args.null_text,
+                # 未提供 --description 时为 None，与空字符串同样不输出说明区域
+                description=args.description or "",
+            )
     except ValueError as exc:
         die(str(exc))
     except sqlite3.Error as exc:
