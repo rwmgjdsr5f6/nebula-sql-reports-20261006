@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""report.export_csv 查询到 CSV 路径的可重复回归测试。
+"""report 查询导出的可重复回归测试：CSV 路径与 HTML 路径。
 
 只依赖 Python 标准库；在临时目录中自行准备小型 SQLite 库，
 用例结束后清理全部临时文件，不依赖仓库中的任何预置数据文件。
@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from unittest import mock
 
 import report
@@ -1784,6 +1785,347 @@ class NullTextTestCase(unittest.TestCase):
         self.assertIn("错误", proc.stderr)
         self.assertIn("--null-text", proc.stderr)
         self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+
+# ---- HTML 导出回归的固定样例 ----
+# 第四条备注：含特殊字符的中文文本，覆盖 &、<、>、双引号、单引号，
+# 另含首尾空格、换行与 <script> 形态；读取页面必须能逐字还原原文，
+# 输入中的标签形态只能显示为文字
+HTML_SPECIAL_TEXT = (
+    "  含特殊字符的中文 & <标签> \"双引号\" '单引号'\n"
+    "换行后 <script>alert('x')</script> 只应显示为文字  "
+)
+# 备注列名：同样覆盖 &、<、>、双引号、单引号五种字符
+HTML_NOTE_ALIAS = "备注&<>\"'列"
+# 带 ORDER BY 的固定查询：列名、列顺序、行顺序以此为准
+HTML_SQL = (
+    'SELECT id AS 编号, note AS "%s" FROM items ORDER BY id'
+    % HTML_NOTE_ALIAS.replace('"', '""')
+)
+# 含 HTML 特殊字符的 NULL 标记：标记本身也必须按文字转义
+HTML_SPECIAL_MARKER = '<空&"标记">'
+# 命名参数筛选查询：命令行样例写入带 BOM 的查询文件
+HTML_WHERE_SQL = (
+    "SELECT id AS 编号, note AS 备注 FROM items "
+    "WHERE id = :who ORDER BY id"
+)
+
+
+class _HtmlTableParser(HTMLParser):
+    """收集页面中每张表格的行与单元格：标签名（th/td）与还原后的文本。
+
+    convert_charrefs=True 使字符引用在回调前已还原为原文，因此收集到
+    的单元格文本可直接与查询结果逐字比较。
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables = []
+        self._table = None
+        self._row = None
+        self._cell = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in ("th", "td") and self._row is not None:
+            self._cell = [tag, []]
+
+    def handle_data(self, data):
+        if self._cell is not None:
+            self._cell[1].append(data)
+
+    def handle_endtag(self, tag):
+        if tag in ("th", "td") and self._cell is not None:
+            self._row.append((self._cell[0], "".join(self._cell[1])))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            self.tables.append(self._table)
+            self._table = None
+
+
+class HtmlExportTestCase(unittest.TestCase):
+    """export_html 与 --format html 命令行的可重复回归测试。
+
+    固定样例库只有一张 items 表：四条备注依次为 SQL NULL、空字符串、
+    普通文本“未填写”与含 HTML 特殊字符的中文文本。每个用例独立准备
+    临时目录、样例库与带 BOM 的查询文件；tearDown 重新只读打开源库，
+    核对表结构及全部数据相对基线零变化，并核对查询文件字节未变。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "html.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，tearDown 中逐一核对
+        self._baseline = self._snapshot_db()
+        # 带 BOM 的命名参数查询文件：含注释与结尾分号，命令行用例共用
+        self.sql_path = os.path.join(self.tmpdir, "查询 文件.sql")
+        self.sql_bytes = b"\xef\xbb\xbf" + (
+            "-- 前置行注释；含分号;\n" + HTML_WHERE_SQL + ";\n"
+        ).encode("utf-8")
+        with open(self.sql_path, "wb") as f:
+            f.write(self.sql_bytes)
+
+    def tearDown(self):
+        # 每个用例（无论成功或失败）结束后，重新只读打开源库，
+        # 核对表结构及全部数据与准备完成时完全一致；查询文件只被
+        # 读取，字节不得改变
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        with open(self.sql_path, "rb") as f:
+            self.assertEqual(f.read(), self.sql_bytes)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            # 备注依次为：SQL NULL、空字符串、普通文本“未填写”、
+            # 含特殊字符的中文文本
+            conn.executemany(
+                "INSERT INTO items (id, note) VALUES (?, ?)",
+                [(1, None), (2, ""), (3, "未填写"), (4, HTML_SPECIAL_TEXT)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        """以只读方式重新读取源库的表结构与 items 全部数据。"""
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            items = conn.execute(
+                "SELECT id, note FROM items ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "items": items}
+
+    @staticmethod
+    def _read_html(path):
+        """按 UTF-8 读取页面文本并解析出全部表格。"""
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        parser = _HtmlTableParser()
+        parser.feed(text)
+        parser.close()
+        return text, parser.tables
+
+    def _assert_report_page(self, path, expected_rows):
+        """核对页面骨架与表格内容，返回页面原文以便进一步断言。
+
+        expected_rows 为 (标签名, 文本) 二元组组成的行列表：表头必须
+        是 th、数据单元格必须是 td，文本为还原字符引用后的原文。
+        """
+        text, tables = self._read_html(path)
+        # 独立的 UTF-8 页面：声明字符编码，标题为“查询报告”
+        self.assertTrue(text.startswith("<!DOCTYPE html>"))
+        self.assertIn('<meta charset="utf-8">', text)
+        self.assertIn("<title>查询报告</title>", text)
+        # 页面只有一张结果表
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0], expected_rows)
+        return text
+
+    @staticmethod
+    def _expected_rows(null_text=""):
+        """默认查询（HTML_SQL）按编号排列的四行期望内容。"""
+        return [
+            [("th", "编号"), ("th", HTML_NOTE_ALIAS)],
+            [("td", "1"), ("td", null_text)],
+            [("td", "2"), ("td", "")],
+            [("td", "3"), ("td", "未填写")],
+            [("td", "4"), ("td", HTML_SPECIAL_TEXT)],
+        ]
+
+    def _run_cli(self, output, params=(), null_text=None):
+        """以 --sql-file + --format html 调用公开命令行入口。"""
+        cmd = [
+            sys.executable,
+            REPORT_PY,
+            "--db",
+            self.db_path,
+            "--sql-file",
+            self.sql_path,
+            "--output",
+            output,
+            "--format",
+            "html",
+        ]
+        if null_text is not None:
+            cmd += ["--null-text", null_text]
+        for item in params:
+            cmd += ["--param", item]
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    # -- 函数入口：页面结构、列名与行列顺序 --------------------------------
+
+    def test_export_returns_row_count_and_expected_page(self):
+        out = os.path.join(self.tmpdir, "report.html")
+        count = report.export_html(self.db_path, HTML_SQL, out)
+
+        # 返回值为数据行数（不含表头）
+        self.assertEqual(count, 4)
+        self.assertTrue(os.path.isfile(out))
+
+        text = self._assert_report_page(out, self._expected_rows())
+        # 列名中的特殊字符在原文中只能以字符引用出现
+        self.assertIn("备注&amp;&lt;&gt;&quot;&#x27;列", text)
+        self.assertNotIn(HTML_NOTE_ALIAS, text)
+        # 普通文本中的标签形态只显示为文字：原文无 <script> 标签
+        self.assertIn("&lt;script&gt;", text)
+        self.assertNotIn("<script", text)
+        # 五种特殊字符的转义形态都能在原文中找到
+        for escaped in ("&amp;", "&lt;", "&gt;", "&quot;", "&#x27;"):
+            self.assertIn(escaped, text)
+
+    # -- 函数入口：NULL 标记 ----------------------------------------------
+
+    def test_default_marker_leaves_null_and_empty_string_empty(self):
+        out = os.path.join(self.tmpdir, "default_marker.html")
+        count = report.export_html(self.db_path, HTML_SQL, out)
+
+        self.assertEqual(count, 4)
+        # 默认标记为空：NULL 与空字符串都是空单元格，且无法区分
+        self._assert_report_page(out, self._expected_rows(""))
+
+    def test_plain_marker_replaces_only_null(self):
+        out = os.path.join(self.tmpdir, "plain_marker.html")
+        count = report.export_html(
+            self.db_path, HTML_SQL, out, null_text="未填写"
+        )
+
+        self.assertEqual(count, 4)
+        # 仅第一条（NULL）被替换；空字符串仍为空单元格；与标记同形的
+        # 普通文本“未填写”原样保留，其余值与行列顺序不变
+        self._assert_report_page(out, self._expected_rows("未填写"))
+
+    def test_special_marker_replaces_null_and_is_escaped_as_text(self):
+        out = os.path.join(self.tmpdir, "special_marker.html")
+        count = report.export_html(
+            self.db_path, HTML_SQL, out, null_text=HTML_SPECIAL_MARKER
+        )
+
+        self.assertEqual(count, 4)
+        text = self._assert_report_page(
+            out, self._expected_rows(HTML_SPECIAL_MARKER)
+        )
+        # 标记同样按文字转义：原文只出现字符引用形态
+        self.assertIn("&lt;空&amp;&quot;标记&quot;&gt;", text)
+        self.assertNotIn(HTML_SPECIAL_MARKER, text)
+
+    # -- 函数入口：参数筛选得到零行 ----------------------------------------
+
+    def test_param_filter_zero_rows_keeps_header_and_returns_zero(self):
+        out = os.path.join(self.tmpdir, "zero.html")
+        count = report.export_html(
+            self.db_path, HTML_WHERE_SQL, out, params={"who": "99"}
+        )
+
+        self.assertEqual(count, 0)
+        # 零行结果仍保留表头，没有任何数据行
+        self._assert_report_page(out, [[("th", "编号"), ("th", "备注")]])
+
+    # -- 函数入口：失败用例 ------------------------------------------------
+
+    def test_function_existing_target_raises_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "existing.html")
+        original_bytes = "已有内容，不得变化\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original_bytes)
+
+        with self.assertRaises(ValueError) as ctx:
+            report.export_html(self.db_path, HTML_SQL, out)
+        self.assertIn("已存在", str(ctx.exception))
+        # 既有文件原字节不变
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+
+    def test_function_missing_param_raises_and_creates_nothing(self):
+        out = os.path.join(self.tmpdir, "missing_param.html")
+        self.assertFalse(os.path.exists(out))
+
+        with self.assertRaises(ValueError) as ctx:
+            report.export_html(self.db_path, HTML_WHERE_SQL, out)
+        self.assertIn("缺少查询引用的参数", str(ctx.exception))
+        self.assertIn("who", str(ctx.exception))
+        # 失败不新建输出文件
+        self.assertFalse(os.path.exists(out))
+
+    # -- 命令行入口：--sql-file + --format html ----------------------------
+
+    def test_cli_bom_sql_file_selects_one_row_despite_csv_extension(self):
+        # 输出文件以 .csv 结尾：输出类型只由 --format 决定
+        out = os.path.join(self.tmpdir, "报告.csv")
+        proc = self._run_cli(out, params=["who=1"], null_text="未填写")
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        # 标准输出恰好一行：成功提示 + 实际输出路径
+        self.assertEqual(proc.stdout, "已导出 1 行数据：%s\n" % out)
+        # 生成的是 HTML 页面：命名参数选中 NULL 行，标记生效
+        self._assert_report_page(
+            out,
+            [
+                [("th", "编号"), ("th", "备注")],
+                [("td", "1"), ("td", "未填写")],
+            ],
+        )
+
+    def test_cli_param_miss_reports_zero_rows(self):
+        out = os.path.join(self.tmpdir, "zero.csv")
+        proc = self._run_cli(out, params=["who=99"], null_text="未填写")
+
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.stdout, "已导出 0 行数据：%s\n" % out)
+        # 零行结果仍保留表头，没有数据行
+        self._assert_report_page(out, [[("th", "编号"), ("th", "备注")]])
+
+    def test_cli_existing_target_exit_one_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "cli_existing.html")
+        original_bytes = "已有内容，不得变化\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original_bytes)
+
+        proc = self._run_cli(out, params=["who=1"])
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn("已存在", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        # 既有文件原字节不变
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+
+    def test_cli_missing_param_exit_one_no_file(self):
+        out = os.path.join(self.tmpdir, "cli_missing_param.html")
+        self.assertFalse(os.path.exists(out))
+        # 查询文件引用 :who，命令行未提供对应 --param
+        proc = self._run_cli(out)
+
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn("缺少查询引用的参数", proc.stderr)
+        self.assertIn("who", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        # 失败不新建输出文件
         self.assertFalse(os.path.exists(out))
 
 
