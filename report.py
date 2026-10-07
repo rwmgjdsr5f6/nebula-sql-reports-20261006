@@ -6,6 +6,7 @@
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
         --param who=小红 --param tag=a=b
+    python report.py --db DB.sqlite --sql "SELECT ..." --preview 10
 
 --sql 与 --sql-file 必须恰好选择一个；查询文件按 UTF-8 读取（允许开头
 一个 BOM），文件内容适用与 --sql 完全相同的规则。仅接受一条 SELECT
@@ -35,6 +36,18 @@ SQL 文本。字符串与注释中的类似文本不算参数；未被查询引�
 单引号按 HTML 转义为文字显示，不产生额外标签或脚本；中文、首尾空格与
 换行完整保留。页面不依赖任何外部资源，直接打开即可查看。
 
+--preview N 在终端预览前 N 条数据（N 为正整数）：仍需 --db，并在
+--sql 与 --sql-file 中恰好选择一个来源，可继续使用 --param 与
+--null-text，但不要求 --output；同时提供 --preview 与 --output 按
+参数错误拒绝。N 缺少值、为零、负数或非整数均拒绝。预览仅支持默认
+CSV 或显式 --format csv：选择 html、或显式提供 --description（即使
+说明为空）都按参数错误拒绝。成功预览时标准输出仅包含带列名的 CSV
+（表头始终输出，数据行最多 N 条，列名、列顺序与查询返回的行顺序保持
+一致；结果不足 N 条时全部显示，零行结果只显示表头），退出码为 0，
+标准错误为空，不追加成功提示，也不创建任何报告或临时文件。查询本身
+不被改写，其筛选、排序与 LIMIT 语义保持不变；预览只在查询结果上截断
+输出行数。
+
 --description TEXT 为 HTML 报告附加一段纯文本查询说明（如筛选口径），
 显示在主标题之后、结果表格之前的独立文本区域；说明不进入表头、数据行、
 浏览器标题或 SQL，也不改变数据行数。说明中的中文、首尾空格、连续空格与
@@ -47,6 +60,7 @@ SQL 文本。字符串与注释中的类似文本不算参数；未被查询引�
 import argparse
 import csv
 import html
+import io
 import os
 import re
 import sqlite3
@@ -373,12 +387,14 @@ def open_readonly(db_path):
     return conn
 
 
-def _execute_query(db_path, sql_text, output_path, params, null_text):
-    """校验全部输入并以只读方式执行查询，返回 (列名列表, 数据行列表)。
+def _prepare_query(db_path, sql_text, params, null_text, output_path=None):
+    """校验全部输入并以只读方式打开数据库、执行查询，返回 (连接, 游标, 列名)。
 
-    汇集 export_csv 与 export_html 共用的拒绝路径：null_text 类型、参数
-    字典、SQL 文本、占位符绑定、输出目录与目标占用、源库打开、查询执行与
-    结果求值。任何失败都抛 ValueError，且此时尚未创建输出文件。
+    汇集导出与预览共用的拒绝路径：null_text 类型、参数字典、SQL 文本、
+    占位符绑定、源库打开与查询执行。output_path 给定时（导出路径）还会
+    校验输出目录存在、目标未被占用，且校验发生在开库之前，任何失败都抛
+    ValueError，此时不会创建输出文件。返回的连接由调用方负责关闭；游标
+    的结果行尚未求值，须调用 _fetch_query 完成惰性取值。
     """
     if not isinstance(null_text, str):
         raise ValueError(
@@ -388,11 +404,12 @@ def _execute_query(db_path, sql_text, output_path, params, null_text):
     statement = validate_single_select(sql_text)
     bound = bind_params(statement, params)
 
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if not os.path.isdir(output_dir):
-        raise ValueError("输出目录不存在：%s" % output_dir)
-    if os.path.exists(output_path):
-        raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
+    if output_path is not None:
+        output_dir = os.path.dirname(os.path.abspath(output_path))
+        if not os.path.isdir(output_dir):
+            raise ValueError("输出目录不存在：%s" % output_dir)
+        if os.path.exists(output_path):
+            raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
 
     conn = open_readonly(db_path)
     try:
@@ -407,14 +424,46 @@ def _execute_query(db_path, sql_text, output_path, params, null_text):
         if cursor.description is None:
             raise ValueError("不支持的语句：仅允许返回结果集的 SELECT")
         headers = [desc[0] for desc in cursor.description]
-        # 结果可能惰性求值：即便 execute 成功，fetchall 期间仍可能因求值
-        # （如整数溢出）抛出 sqlite3.Error。与开始执行阶段统一归类为
-        # ValueError，调用方无需按错误时点分别处理两种异常；此时尚未创建
-        # 输出文件，即使部分结果已可用也不会被当作成功写出。
-        try:
-            rows = cursor.fetchall()
-        except sqlite3.Error as exc:
-            raise ValueError("SQL 执行失败：%s" % exc)
+    except BaseException:
+        conn.close()
+        raise
+    return conn, cursor, headers
+
+
+def _fetch_query(cursor, limit=None):
+    """取完游标中的结果行；limit 给定时至多取该数目的行，返回数据行列表。
+
+    结果可能惰性求值：即便 execute 成功，取值期间仍可能因求值（如整数
+    溢出）抛出 sqlite3.Error，统一归类为 ValueError。传入 limit 时逐行
+    取值并在达到上限后停止，不改动查询文本本身——查询的筛选、排序与
+    LIMIT 语义完全保持不变，截断只发生在结果输出层面。
+    """
+    try:
+        if limit is None:
+            return cursor.fetchall()
+        rows = []
+        while len(rows) < limit:
+            row = cursor.fetchone()
+            if row is None:
+                break
+            rows.append(row)
+        return rows
+    except sqlite3.Error as exc:
+        raise ValueError("SQL 执行失败：%s" % exc)
+
+
+def _execute_query(db_path, sql_text, output_path, params, null_text):
+    """校验全部输入并以只读方式执行查询，返回 (列名列表, 数据行列表)。
+
+    导出路径的完整拒绝流程：null_text 类型、参数字典、SQL 文本、占位符
+    绑定、输出目录与目标占用、源库打开、查询执行与结果求值。任何失败都
+    抛 ValueError，且此时尚未创建输出文件。
+    """
+    conn, cursor, headers = _prepare_query(
+        db_path, sql_text, params, null_text, output_path
+    )
+    try:
+        rows = _fetch_query(cursor)
     finally:
         conn.close()
     return headers, rows
@@ -470,6 +519,38 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     _write_output_file(output_path, write_csv)
 
     return len(rows)
+
+
+def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
+    """执行查询并返回前至多 limit 行结果的 CSV 文本（带列名），不写任何文件。
+
+    limit 必须为正整数：表头始终输出一行，数据行至多 limit 行；结果不足
+    limit 行时全部包含，零行结果只返回表头。params 与 null_text 的含义与
+    export_csv 完全相同。SQL 文本不被改写，查询的筛选、排序与 LIMIT 语义
+    保持原样，截断只发生在结果取值阶段（逐行取到 limit 行为止）。
+
+    源库缺失或无效、SQL 或参数不合法、查询执行或任一结果行求值失败都抛
+    ValueError；此时尚未生成 CSV 文本，调用方不会留下部分预览。返回文本
+    以 UTF-8 编码写出时与 export_csv 的文件内容遵循相同的 csv 模块规则
+    （含中文、逗号、引号与换行的处理）。
+    """
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        raise ValueError("预览行数必须为正整数，收到 %r" % (limit,))
+
+    conn, cursor, headers = _prepare_query(db_path, sql_text, params, null_text)
+    try:
+        rows = _fetch_query(cursor, limit)
+    finally:
+        conn.close()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow(
+            [null_text if value is None else value for value in row]
+        )
+    return buf.getvalue()
 
 
 def render_html(headers, rows, null_text, description=""):
@@ -596,7 +677,13 @@ def parse_args(argv):
     parser.add_argument(
         "--sql-file", help="包含一条 SELECT 查询的 UTF-8 文件路径（允许一个 BOM）"
     )
-    parser.add_argument("--output", required=True, help="输出文件路径（不得已存在）")
+    parser.add_argument("--output", help="输出文件路径（不得已存在）；预览时省略")
+    parser.add_argument(
+        "--preview",
+        metavar="N",
+        default=None,
+        help="终端预览模式：在标准输出打印带列名的 CSV，至多显示 N 条数据行（正整数）",
+    )
     parser.add_argument(
         "--format",
         choices=["csv", "html"],
@@ -625,12 +712,31 @@ def parse_args(argv):
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
         parser.error("--sql 与 --sql-file 必须恰好选择一个")
-    # 显式提供 --description（即使为空）时只允许 HTML 格式；
-    # 以 None 区分"未提供"与"提供空字符串"
-    if args.description is not None and args.format != "html":
-        parser.error(
-            "--description 仅支持 --format html：CSV 报告不包含查询说明文本"
-        )
+    if args.preview is not None:
+        # 预览模式：与文件导出互斥，且不要求/不允许 --output
+        if args.output is not None:
+            parser.error("--preview 与 --output 不能同时提供：预览只写入标准输出")
+        # 仅接受十进制正整数：缺少值（空串）、零、负数、小数或其他非整数一律拒绝
+        if re.fullmatch(r"[0-9]+", args.preview) is None or int(args.preview) <= 0:
+            parser.error(
+                "--preview 需要正整数 N（缺少值、零、负数或非整数均拒绝）：%r"
+                % args.preview
+            )
+        args.preview = int(args.preview)
+        if args.format == "html":
+            parser.error("--preview 仅支持 CSV：请省略 --format 或使用 --format csv")
+        # 显式提供 --description（即使为空）也不允许；None 区分"未提供"与"空串"
+        if args.description is not None:
+            parser.error("--preview 不支持 --description：预览仅输出 CSV 数据")
+    elif args.output is None:
+        parser.error("必须提供 --output 输出文件，或使用 --preview N 在终端预览")
+    else:
+        # 显式提供 --description（即使为空）时只允许 HTML 格式；
+        # 以 None 区分"未提供"与"提供空字符串"
+        if args.description is not None and args.format != "html":
+            parser.error(
+                "--description 仅支持 --format html：CSV 报告不包含查询说明文本"
+            )
     args.params = parse_param_options(args.param, parser)
     return args
 
@@ -644,6 +750,25 @@ def main(argv=None):
             sql_text = read_sql_file(args.sql_file)
         except ValueError as exc:
             die(str(exc))
+    if args.preview is not None:
+        # 终端预览：成功时标准输出只含带列名的 CSV，不追加任何提示文本；
+        # 全部结果行求值成功后才写出，失败路径不留下部分预览
+        try:
+            content = preview_csv(
+                args.db,
+                sql_text,
+                args.preview,
+                params=args.params,
+                null_text=args.null_text,
+            )
+        except ValueError as exc:
+            die(str(exc))
+        except sqlite3.Error as exc:
+            die("数据库错误：%s" % exc)
+        except OSError as exc:
+            die("文件错误：%s" % exc)
+        sys.stdout.write(content)
+        return 0
     try:
         if args.format == "csv":
             row_count = export_csv(
