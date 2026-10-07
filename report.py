@@ -34,6 +34,14 @@ SQL 文本。字符串与注释中的类似文本不算参数；未被查询引�
 查询结果一致；零行结果仍保留表头。单元格文本中的 &、<、>、双引号与
 单引号按 HTML 转义为文字显示，不产生额外标签或脚本；中文、首尾空格与
 换行完整保留。页面不依赖任何外部资源，直接打开即可查看。
+
+--description TEXT 为 HTML 报告附加一段纯文本查询说明（仅 --format html
+可用）：说明作为独立文本区域出现在主标题之后、结果表格之前，不进入
+表头、数据行、浏览器标题或 SQL，也不改变返回的数据行数。说明中的中文、
+首尾空格、连续空格与换行在页面中原样保留（仅含空白的非空说明也照样
+显示）；&、<、>、双引号与单引号按文字转义，类似 <script> 的内容不会
+形成标签或执行脚本。省略该选项或传入空字符串时，生成的 HTML 与不带
+说明的既有导出逐字节一致。
 """
 
 import argparse
@@ -464,11 +472,16 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     return len(rows)
 
 
-def render_html(headers, rows, null_text):
+def render_html(headers, rows, null_text, description=""):
     """把查询结果渲染为独立 HTML 页面文本（UTF-8，不依赖外部资源）。
 
     列名与单元格文本中的 &、<、>、双引号、单引号一律转义为字符引用，
     只作为文字显示；NULL 单元格显示 null_text，其余值按 str 转为文本。
+
+    description 为非空字符串时，在主标题之后、结果表格之前渲染一个独立
+    文本区域：特殊字符同样转义为文字，中文、首尾空格、连续空格与换行
+    经 white-space:pre-wrap 原样保留。description 为空字符串时不渲染
+    该区域，输出与不带说明的既有页面逐字节一致。
     """
     lines = [
         "<!DOCTYPE html>",
@@ -484,6 +497,12 @@ def render_html(headers, rows, null_text):
         "</head>",
         "<body>",
         "<h1>查询报告</h1>",
+    ]
+    if description:
+        lines.append(
+            '<div style="white-space:pre-wrap">%s</div>' % html.escape(description)
+        )
+    lines += [
         "<table>",
         "<thead>",
         "<tr>" + "".join("<th>%s</th>" % html.escape(h) for h in headers) + "</tr>",
@@ -500,7 +519,8 @@ def render_html(headers, rows, null_text):
     return "\n".join(lines)
 
 
-def export_html(db_path, sql_text, output_path, params=None, null_text=""):
+def export_html(db_path, sql_text, output_path, params=None, null_text="",
+                description=""):
     """执行查询并将结果独占写入目标 HTML 报告，返回数据行数（不含表头）。
 
     输入与可选参数和 export_csv 完全相同，拒绝路径（源库缺失或无效、SQL
@@ -508,16 +528,28 @@ def export_html(db_path, sql_text, output_path, params=None, null_text=""):
     抛 ValueError 且不创建文件；写入失败清理本次新建的半成品后抛
     ValueError，既有文件原字节不变。
 
+    description 为可选的纯文本查询说明：非空时作为独立文本区域出现在
+    主标题之后、结果表格之前，不进入表头、数据行、浏览器标题或 SQL，
+    也不改变返回的数据行数。说明中的中文、首尾空格、连续空格与换行
+    原样保留，仅含空白的非空说明照样显示；&、<、>、双引号与单引号
+    转义为文字，类似 <script> 的内容不会形成标签或执行脚本。必须是
+    字符串，非字符串值抛 ValueError 且不创建输出文件；省略或传入空
+    字符串时输出与不带说明的既有导出逐字节一致。
+
     输出为独立 UTF-8 页面：声明字符编码，标题"查询报告"，一张表格，
     表头 th、数据 td，列名、列顺序、行顺序与查询结果一致；零行结果仍
     保留表头并返回 0。SQL NULL 显示 null_text（默认空单元格）；空字符串
     和与标记同形的普通文本不额外转换，其他值按 str 转为文本。文本中的
     HTML 特殊字符转义为文字显示，不产生额外标签或脚本。
     """
+    if not isinstance(description, str):
+        raise ValueError(
+            "description 必须是字符串，收到 %s" % type(description).__name__
+        )
     headers, rows = _execute_query(
         db_path, sql_text, output_path, params, null_text
     )
-    page = render_html(headers, rows, null_text)
+    page = render_html(headers, rows, null_text, description)
 
     _write_output_file(output_path, lambda f: f.write(page))
 
@@ -583,10 +615,22 @@ def parse_args(argv):
         default="",
         help="SQL NULL 在输出中的导出标记，默认为空；标记原样写入，可含空格、逗号、引号与换行",
     )
+    parser.add_argument(
+        "--description",
+        metavar="TEXT",
+        help="HTML 报告的纯文本查询说明（仅 --format html 可用），显示在主标题与结果表格之间",
+    )
     args = parser.parse_args(argv)
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
         parser.error("--sql 与 --sql-file 必须恰好选择一个")
+    # 显式提供 --description（即使为空）时只允许 HTML 输出；
+    # 此判定同样发生在读文件、开库与创建输出之前
+    if args.description is not None and args.format != "html":
+        parser.error(
+            "--description 仅支持 HTML 输出：请搭配 --format html"
+            "（当前格式为 %s）" % args.format
+        )
     args.params = parse_param_options(args.param, parser)
     return args
 
@@ -602,12 +646,20 @@ def main(argv=None):
             die(str(exc))
     exporter = export_csv if args.format == "csv" else export_html
     try:
+        # parse_args 已保证 --description 只与 --format html 同现，
+        # 故 csv 路径下 args.description 必为 None，无需向 export_csv 传递
+        extra = {}
+        if exporter is export_html:
+            extra["description"] = (
+                args.description if args.description is not None else ""
+            )
         row_count = exporter(
             args.db,
             sql_text,
             args.output,
             params=args.params,
             null_text=args.null_text,
+            **extra
         )
     except ValueError as exc:
         die(str(exc))
