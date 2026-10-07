@@ -2129,5 +2129,256 @@ class HtmlExportTestCase(unittest.TestCase):
         self.assertFalse(os.path.exists(out))
 
 
+# ---- export_html 写入中断与原路径重试的固定样例 ----
+# 小型合成库：items 只有 id、note 两列，两行分别为 NULL 与含 HTML
+# 特殊字符的中文；查询与空值标记在各用例中固定不变
+HTML_ITEMS_SQL = "SELECT id AS 编号, note AS 备注 FROM items ORDER BY id"
+HTML_ITEMS_MARKER = "未填写"
+HTML_ITEMS_SPECIAL = "中文<&>"
+# 写入中断故障的固定消息：可重复、与真实磁盘状态无关
+HTML_WRITE_FAIL_MESSAGE = "写入中断"
+# “已写入非空 UTF-8 页面片段”时点的固定片段边界：标题行之后、
+# 样式表开头几个字符；含中文，是完整页面的非空前缀但远未完成
+HTML_FRAGMENT_MARKER = "<title>查询报告</title>\n<sty"
+# 重试成功后经 HTMLParser 还原的完整期望：表头 + 两条数据
+HTML_ITEMS_EXPECTED_ROWS = [
+    [("th", "编号"), ("th", "备注")],
+    [("td", "1"), ("td", HTML_ITEMS_MARKER)],
+    [("td", "2"), ("td", HTML_ITEMS_SPECIAL)],
+]
+
+
+class _HtmlInterruptedFile:
+    """包装 export_html 的真实输出文件，在唯一一次页面 write 时制造 OSError。
+
+    partial 为 False 时，尚未写入任何字节即失败，对应“目标已新建但尚未
+    写入内容”；partial 为 True 时，先把页面开头的非空 UTF-8 片段写入并
+    flush，再抛固定 OSError，对应“已写入部分页面但尚未完成”。on_fail
+    回调使用例能在异常抛出的同一时点读取目标的真实落盘状态。
+    """
+
+    def __init__(self, real_file, partial, on_fail):
+        self._real = real_file
+        self._partial = partial
+        self._on_fail = on_fail
+        # export_html 把整页交给唯一一次 write；记录该文本供用例独立核对
+        self.page = None
+
+    def write(self, data):
+        self.page = data
+        if self._partial:
+            cut = data.index(HTML_FRAGMENT_MARKER) + len(HTML_FRAGMENT_MARKER)
+            self._real.write(data[:cut])
+            self._real.flush()
+        self._on_fail()
+        raise OSError(HTML_WRITE_FAIL_MESSAGE)
+
+    def __enter__(self):
+        self._real.__enter__()
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._real.__exit__(*exc_info)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class HtmlWriteInterruptionTestCase(unittest.TestCase):
+    """export_html 新建目标后写入中断的清理与原路径重试回归测试。
+
+    两个用例分别覆盖：目标已创建但尚未写入任何内容、已写入非空 UTF-8
+    页面片段但尚未完成。故障统一为消息“写入中断”的 OSError，且都发生在
+    独占新建目标之后的写入阶段（不能由查询失败或打开文件之前的失败替代）。
+    故障调用必须抛 ValueError（含“无法写入输出文件”、目标路径与“写入
+    中断”）、不返回行数，并清理本次新建的半成品；目录与同目录预置文件
+    不受影响。随后用同一源库、同一查询、同一空值标记与同一输出路径立即
+    重试，必须返回 2 并生成内容完整的 UTF-8 页面。失败后与重试后分别以
+    只读连接重读源库，核对表结构与全部数据与准备基线一致。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "items.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，失败后、重试后与 tearDown 分别核对
+        self._baseline = self._snapshot_db()
+
+    def tearDown(self):
+        # 用例结束前最后一次只读重读，兜底核对源库与准备基线完全一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            # 固定两行：SQL NULL 与含 &、<、> 的中文文本
+            conn.executemany(
+                "INSERT INTO items (id, note) VALUES (?, ?)",
+                [(1, None), (2, HTML_ITEMS_SPECIAL)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        """以只读方式重新读取源库的表结构（sqlite_master 与列定义）及全部数据。"""
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            columns = conn.execute(
+                "PRAGMA table_info(items)"
+            ).fetchall()
+            items = conn.execute(
+                "SELECT id, note FROM items ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "columns": columns, "items": items}
+
+    def _assert_interruption_then_retry(self, out_name, partial):
+        """注入一次写入中断，核对报错、半成品清理与源库状态后原路径重试。"""
+        out = os.path.join(self.tmpdir, out_name)
+        # 同目录预置的另一文件：故障、清理与重试都不得触及其字节
+        sibling = os.path.join(self.tmpdir, "预置 " + out_name + ".txt")
+        sibling_bytes = ("预置文件，不得变化：%s\n" % out_name).encode("utf-8")
+        with open(sibling, "wb") as f:
+            f.write(sibling_bytes)
+
+        # 失败前：输出父目录已存在，目标起初不存在
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        self.assertFalse(os.path.exists(out))
+
+        observed = {"exists": None, "bytes": None, "wrapper": None}
+
+        def on_fail():
+            # 故障发生瞬间：目标已被本调用独占新建，记录当时真实落盘内容
+            observed["exists"] = os.path.exists(out)
+            with open(out, "rb") as f:
+                observed["bytes"] = f.read()
+
+        real_open = open
+
+        def flaky_open(path, mode="r", *args, **kwargs):
+            f = real_open(path, mode, *args, **kwargs)
+            if os.path.abspath(path) == os.path.abspath(out) and "x" in mode:
+                wrapper = _HtmlInterruptedFile(f, partial, on_fail)
+                observed["wrapper"] = wrapper
+                return wrapper
+            return f
+
+        with mock.patch.object(report, "open", create=True, new=flaky_open):
+            with self.assertRaises(ValueError) as ctx:
+                report.export_html(
+                    self.db_path,
+                    HTML_ITEMS_SQL,
+                    out,
+                    null_text=HTML_ITEMS_MARKER,
+                )
+
+        # 故障确实发生在“目标已新建之后的写入阶段”：包装器的 write 被调用，
+        # 且故障瞬间目标存在——排除查询失败或打开文件之前的失败
+        self.assertIsNotNone(observed["wrapper"])
+        self.assertIsNotNone(observed["wrapper"].page)
+        self.assertTrue(observed["exists"])
+
+        # 调用结果为 ValueError：错误文本含原因前缀、目标路径与原始故障消息，
+        # 不返回行数（异常即结束）
+        message = str(ctx.exception)
+        self.assertIn("无法写入输出文件", message)
+        self.assertIn(out, message)
+        self.assertIn(HTML_WRITE_FAIL_MESSAGE, message)
+
+        # 故障瞬间的两种实际文件状态
+        fragment_bytes = observed["bytes"]
+        if partial:
+            # 已写入非空 UTF-8 页面片段：可严格解码，是整页的真实前缀，
+            # 但尚未写完（既无表格也无收尾标签）
+            self.assertTrue(len(fragment_bytes) > 0)
+            fragment_text = fragment_bytes.decode("utf-8")
+            page = observed["wrapper"].page
+            cut = page.index(HTML_FRAGMENT_MARKER) + len(HTML_FRAGMENT_MARKER)
+            self.assertEqual(fragment_bytes, page[:cut].encode("utf-8"))
+            self.assertTrue(fragment_text.startswith("<!DOCTYPE html>"))
+            self.assertIn("查询报告", fragment_text)
+            self.assertNotIn("<table", fragment_text)
+            self.assertNotIn("</html>", fragment_text)
+        else:
+            # 目标已新建但尚未写入任何内容
+            self.assertEqual(fragment_bytes, b"")
+
+        # 调用结束后半成品已清除，所在目录仍存在
+        self.assertFalse(os.path.exists(out))
+        self.assertTrue(os.path.isdir(self.tmpdir))
+        # 同目录预置文件字节保持不变
+        with open(sibling, "rb") as f:
+            self.assertEqual(f.read(), sibling_bytes)
+
+        # 失败后立即只读重读源库：表结构与全部数据与准备时一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+
+        # 故障解除：同一源库、同一查询、同一空值标记与同一输出路径立即重试
+        count = report.export_html(
+            self.db_path,
+            HTML_ITEMS_SQL,
+            out,
+            null_text=HTML_ITEMS_MARKER,
+        )
+        self.assertEqual(count, 2)
+
+        # 生成 UTF-8 HTML 页：字节可严格按 UTF-8 解码
+        with open(out, "rb") as f:
+            page_bytes = f.read()
+        text = page_bytes.decode("utf-8")
+        self.assertTrue(text.startswith("<!DOCTYPE html>"))
+        self.assertIn('<meta charset="utf-8">', text)
+        self.assertIn("<title>查询报告</title>", text)
+
+        # 仅有一张表；表头按“编号”“备注”排列；两条数据按编号呈现，
+        # NULL 显示为“未填写”
+        parser = _HtmlTableParser()
+        parser.feed(text)
+        parser.close()
+        self.assertEqual(len(parser.tables), 1)
+        self.assertEqual(parser.tables[0], HTML_ITEMS_EXPECTED_ROWS)
+
+        # 中文<&> 还原为原文本且不产生额外标签：原文只含转义后的文字形态
+        self.assertIn("中文&lt;&amp;&gt;", text)
+        self.assertNotIn(HTML_ITEMS_SPECIAL, text)
+        self.assertNotIn("中文<", text)
+
+        if partial:
+            # 故障瞬间的片段确为最终页面的真实前缀（由未打补丁的重试独立产出）
+            self.assertTrue(page_bytes.startswith(fragment_bytes))
+            self.assertNotEqual(page_bytes, fragment_bytes)
+
+        # 重试后同目录预置文件字节仍保持不变
+        with open(sibling, "rb") as f:
+            self.assertEqual(f.read(), sibling_bytes)
+
+        # 重试后再次只读重读源库：表结构与全部数据仍与准备时一致
+        self.assertEqual(self._snapshot_db(), self._baseline)
+
+    def test_interrupted_before_any_write_clears_target_and_retry_succeeds(self):
+        # 目标已新建但尚未写入内容时写入中断
+        self._assert_interruption_then_retry(
+            "interrupted_empty.html", partial=False
+        )
+
+    def test_interrupted_after_utf8_fragment_clears_target_and_retry_succeeds(self):
+        # 已写入非空 UTF-8 页面片段但尚未完成时写入中断
+        self._assert_interruption_then_retry(
+            "interrupted_partial.html", partial=True
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
