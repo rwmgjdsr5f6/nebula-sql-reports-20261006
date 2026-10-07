@@ -35,6 +35,16 @@ SQL 文本。字符串与注释中的类似文本不算参数；未被查询引�
 单引号按 HTML 转义为文字显示，不产生额外标签或脚本；中文、首尾空格与
 换行完整保留。页面不依赖任何外部资源，直接打开即可查看。
 
+--title TEXT 为 HTML 报告指定自定义标题：同时用作浏览器页面标题
+（<title>）与表格前的主标题（<h1>），原有 description 说明仍显示在
+主标题之后、表格之前。标题先去除首尾空白，中文与内部空白保留；&、<、
+>、单双引号在两个标题位置都按 HTML 文字转义，不产生额外标签或脚本。
+标题不进入 SQL、查询说明、表头或数据行，也不改变数据行数、列名、列
+顺序与行顺序。省略标题或显式提供默认标题"查询报告"时，导出文件与
+未提供该选项逐字节一致。标题去除首尾空白后为空（纯空白）按参数错误
+拒绝。该选项仅与 --format html 的文件导出搭配使用；与 csv、默认格式
+或 --preview 搭配时按参数错误拒绝。
+
 --description TEXT 为 HTML 报告附加一段纯文本查询说明（如筛选口径），
 显示在主标题之后、结果表格之前的独立文本区域；说明不进入表头、数据行、
 浏览器标题或 SQL，也不改变数据行数。说明中的中文、首尾空格、连续空格与
@@ -553,7 +563,7 @@ def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
     return len(shown)
 
 
-def render_html(headers, rows, null_text, description=""):
+def render_html(headers, rows, null_text, description="", title="查询报告"):
     """把查询结果渲染为独立 HTML 页面文本（UTF-8，不依赖外部资源）。
 
     列名与单元格文本中的 &、<、>、双引号、单引号一律转义为字符引用，
@@ -563,13 +573,17 @@ def render_html(headers, rows, null_text, description=""):
     文本区域：说明同样按文字转义，并以 white-space:pre-wrap 保留中文、
     首尾空格、连续空格与换行；空字符串（默认）不输出该区域，页面与未
     提供说明时逐字节一致。
+
+    title 为报告标题：同时用作浏览器页面标题（<title>）与表格前的主
+    标题（<h1>），两处都按 HTML 文字转义。默认"查询报告"，此时页面与
+    引入该参数之前逐字节一致。
     """
     lines = [
         "<!DOCTYPE html>",
         '<html lang="zh-CN">',
         "<head>",
         '<meta charset="utf-8">',
-        "<title>查询报告</title>",
+        "<title>%s</title>" % html.escape(title),
         "<style>",
         "table{border-collapse:collapse}",
         "th,td{border:1px solid #999;padding:4px 8px;"
@@ -577,7 +591,7 @@ def render_html(headers, rows, null_text, description=""):
         "</style>",
         "</head>",
         "<body>",
-        "<h1>查询报告</h1>",
+        "<h1>%s</h1>" % html.escape(title),
     ]
     if description != "":
         # 独立文本区域：内联 pre-wrap 样式，使省略说明时样式表与页面其余
@@ -603,7 +617,7 @@ def render_html(headers, rows, null_text, description=""):
 
 
 def export_html(db_path, sql_text, output_path, params=None, null_text="",
-                description=""):
+                description="", title="查询报告"):
     """执行查询并将结果独占写入目标 HTML 报告，返回数据行数（不含表头）。
 
     输入与可选参数和 export_csv 完全相同，拒绝路径（源库缺失或无效、SQL
@@ -622,18 +636,32 @@ def export_html(db_path, sql_text, output_path, params=None, null_text="",
     不改变数据行数；说明中的中文、首尾空格、连续空格与换行完整保留，
     HTML 特殊字符按文字转义。必须是字符串，非字符串值抛 ValueError 且
     不创建输出文件；省略或传入空字符串时，输出与未提供说明逐字节一致。
+
+    title 为可选的报告标题：同时用作浏览器页面标题与表格前的主标题，
+    两处都按 HTML 文字转义；先去除首尾空白，中文与内部空白保留。标题
+    不进入 SQL、查询说明、表头或数据行，也不改变数据行数、列名、列
+    顺序与行顺序。必须是字符串且去除首尾空白后非空，否则抛 ValueError
+    且不创建输出文件；省略或传入默认标题"查询报告"时，输出与未提供
+    标题逐字节一致。
     """
-    # 说明类型是 HTML 入口的专属校验，仍最先报告；之后与另外两个入口
-    # 共用同一份查询准备（空值标记类型、参数字典、SQL、占位符）
+    # 说明与标题类型是 HTML 入口的专属校验，仍最先报告；之后与另外两个
+    # 入口共用同一份查询准备（空值标记类型、参数字典、SQL、占位符）
     if not isinstance(description, str):
         raise ValueError(
             "description 必须是字符串，收到 %s" % type(description).__name__
         )
+    if not isinstance(title, str):
+        raise ValueError(
+            "title 必须是字符串，收到 %s" % type(title).__name__
+        )
+    title = title.strip()
+    if title == "":
+        raise ValueError("title 去除首尾空白后为空：报告标题不能是空文本")
     statement, bound = _prepare_statement(sql_text, params, null_text)
     # 输入校验通过后先预查输出目录与目标占用，再以只读方式打开源库
     _ensure_output_available(output_path)
     headers, rows = _run_readonly(db_path, statement, bound)
-    page = render_html(headers, rows, null_text, description)
+    page = render_html(headers, rows, null_text, description, title)
 
     _write_output_file(output_path, lambda f: f.write(page))
 
@@ -712,6 +740,12 @@ def parse_args(argv):
         default=None,
         help="HTML 报告主标题后的纯文本查询说明；仅与 --format html 搭配使用",
     )
+    parser.add_argument(
+        "--title",
+        metavar="TEXT",
+        default=None,
+        help="HTML 报告的自定义标题（浏览器标题与主标题）；仅与 --format html 搭配使用",
+    )
     args = parser.parse_args(argv)
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
@@ -726,6 +760,8 @@ def parse_args(argv):
             parser.error("--preview 仅支持 CSV 格式，不接受 --format html")
         if args.description is not None:
             parser.error("--preview 不支持 --description：预览不包含查询说明文本")
+        if args.title is not None:
+            parser.error("--preview 不支持 --title：预览不包含报告标题")
     elif args.output is None:
         parser.error("缺少 --output：导出模式必须提供输出文件路径")
     # 显式提供 --description（即使为空）时只允许 HTML 格式；
@@ -733,6 +769,11 @@ def parse_args(argv):
     if args.description is not None and args.format != "html":
         parser.error(
             "--description 仅支持 --format html：CSV 报告不包含查询说明文本"
+        )
+    # --title 同样仅与 --format html 的文件导出搭配
+    if args.title is not None and args.format != "html":
+        parser.error(
+            "--title 仅支持 --format html：CSV 报告不包含报告标题"
         )
     args.params = parse_param_options(args.param, parser)
     return args
@@ -775,6 +816,8 @@ def main(argv=None):
                 null_text=args.null_text,
                 # 未提供 --description 时为 None，与空字符串同样不输出说明区域
                 description=args.description or "",
+                # 未提供 --title 时为 None，与默认标题"查询报告"输出逐字节一致
+                title=args.title if args.title is not None else "查询报告",
             )
     except ValueError as exc:
         die(str(exc))
