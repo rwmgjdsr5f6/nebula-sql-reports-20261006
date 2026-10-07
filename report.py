@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""以只读方式对 SQLite 执行一条 SELECT，并将结果导出为带列名的 CSV。
+"""以只读方式对 SQLite 执行一条 SELECT，并将结果导出为带列名的 CSV 或 HTML。
 
 用法:
     python report.py --db DB.sqlite --sql "SELECT ..." --output out.csv
-    python report.py --db DB.sqlite --sql-file query.sql --output out.csv
+    python report.py --db DB.sqlite --sql-file query.sql --output out.html \
+        --format html
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
         --param who=小红 --param tag=a=b
+
+--format 仅接受 csv 或 html，默认 csv：输出内容与输出路径的类型完全由
+该选项决定，与文件名后缀无关。CSV 为带列名的逗号分隔文本；HTML 为独立
+的 UTF-8 离线页面（标题“查询报告”，内含一张表格：表头 th、数据 td），
+不引用任何外部资源。两种格式共用同一条查询、同一套参数与 NULL 标记规则，
+均返回不含表头的数据行数。
 
 --sql 与 --sql-file 必须恰好选择一个；查询文件按 UTF-8 读取（允许开头
 一个 BOM），文件内容适用与 --sql 完全相同的规则。仅接受一条 SELECT
@@ -27,10 +34,17 @@ SQL 文本。字符串与注释中的类似文本不算参数；未被查询引�
 NULL，不影响列名、列顺序、行顺序、非空值与数据行数。源数据中的空
 字符串仍写为空字段，恰好与标记相同的普通文本不做额外转义，也不保证
 CSV 能反向还原值类型。
+
+HTML 导出中该标记的语义相同：数据单元格为 NULL 时写入标记文本，
+默认空字符串（即空单元格）；空字符串与恰好同形的普通文本都不额外
+转换，其他值按 str 转为文本。列名与单元格中的 &、<、>、双引号和
+单引号按 HTML 文字转义显示，不能产生额外标签或脚本；中文、首尾
+空格与换行完整保留（首尾空格与换行在页面中可见，不做折叠）。
 """
 
 import argparse
 import csv
+import html
 import os
 import re
 import sqlite3
@@ -357,23 +371,13 @@ def open_readonly(db_path):
     return conn
 
 
-def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
-    """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
+def _run_select(db_path, sql_text, output_path, params):
+    """两种格式共用的导出前置：校验输入与输出目标，只读执行查询并取回结果。
 
-    params 为可选的 名称->文本 参数字典（键不带占位符前缀），为查询中的
-    :name、@name、$name 命名参数提供值；省略或传入 None 时与不提供参数
-    的原有调用行为完全一致。值只作为绑定数据参与查询，绝不拼进 SQL 文本。
-
-    null_text 为可选的 SQL NULL 导出标记：数据单元格为 NULL 时写入该文本，
-    默认空字符串（即空字段，与原行为一致）。必须是字符串，非字符串值
-    （None、数字等）抛 ValueError 且不创建输出文件。空字符串是有效标记；
-    标记不影响列名、列顺序、行顺序、非空值与数据行数，源数据中的空字符串
-    仍写为空字段。
+    参数与 SQL 规则与 export_csv 完全相同。成功时查询已执行完毕、源库
+    连接已关闭，返回 (列名列表, 数据行列表)；任何失败都抛 ValueError，
+    且不创建输出文件（输出目录缺失、目标已存在在打开源库之前即拒绝）。
     """
-    if not isinstance(null_text, str):
-        raise ValueError(
-            "null_text 必须是字符串，收到 %s" % type(null_text).__name__
-        )
     params = validate_params(params)
     statement = validate_single_select(sql_text)
     bound = bind_params(statement, params)
@@ -407,26 +411,144 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
             raise ValueError("SQL 执行失败：%s" % exc)
     finally:
         conn.close()
+    return headers, rows
 
-    # "x" = 独占新建：目标已存在则直接失败，从根本上杜绝覆盖或截断
+
+def _write_new_file(output_path, write_body):
+    """以独占新建方式打开目标并由 write_body(f) 写入文本，绝不触及既有文件。
+
+    "x" = 独占新建：目标已存在则直接失败，从根本上杜绝覆盖或截断。
+    write_body 直接向真实文件对象流式写入（保持与逐行落盘相同的失败
+    时点）；写入失败（含编码失败）时，到此的文件必为本调用刚创建的
+    半成品，清理后统一抛 ValueError；既存文件不可能被触及。
+    """
     try:
         with open(output_path, "x", encoding="utf-8", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-            for row in rows:
-                writer.writerow(
-                    [null_text if value is None else value for value in row]
-                )
+            write_body(f)
     except FileExistsError:
         raise ValueError("输出目标已存在，拒绝覆盖：%s" % output_path)
     except (OSError, UnicodeError, TypeError) as exc:
-        # 到此的文件必为本调用刚创建的半成品，清理后报错；既存文件不可能被触及
         try:
             os.remove(output_path)
         except OSError:
             pass
         raise ValueError("无法写入输出文件 %s：%s" % (output_path, exc))
 
+
+def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
+    """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
+
+    params 为可选的 名称->文本 参数字典（键不带占位符前缀），为查询中的
+    :name、@name、$name 命名参数提供值；省略或传入 None 时与不提供参数
+    的原有调用行为完全一致。值只作为绑定数据参与查询，绝不拼进 SQL 文本。
+
+    null_text 为可选的 SQL NULL 导出标记：数据单元格为 NULL 时写入该文本，
+    默认空字符串（即空字段，与原行为一致）。必须是字符串，非字符串值
+    （None、数字等）抛 ValueError 且不创建输出文件。空字符串是有效标记；
+    标记不影响列名、列顺序、行顺序、非空值与数据行数，源数据中的空字符串
+    仍写为空字段。
+    """
+    if not isinstance(null_text, str):
+        raise ValueError(
+            "null_text 必须是字符串，收到 %s" % type(null_text).__name__
+        )
+    headers, rows = _run_select(db_path, sql_text, output_path, params)
+
+    def write_body(f):
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(
+                [null_text if value is None else value for value in row]
+            )
+
+    _write_new_file(output_path, write_body)
+    return len(rows)
+
+
+# HTML 转义：五个字符统一作为文字显示，杜绝额外标签、属性或脚本
+_HTML_ESCAPE_MAP = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#x27;",
+}
+
+
+def html_text(value):
+    """把单元格/列名文本转义为可放入 HTML 元素内容的安全文字。
+
+    &、<、>、双引号、单引号均转义为字符引用；其余字符（含中文、首尾
+    空格与换行）原样保留。换行以标签外文本形式保留在源码中，配合表格
+    容器的 white-space: pre-wrap 在页面中完整显示而非折叠成空格。
+    """
+    return "".join(_HTML_ESCAPE_MAP.get(ch, ch) for ch in value)
+
+
+def render_html(headers, rows, null_text=""):
+    """按查询结果渲染独立的 UTF-8 HTML 页面文本：标题“查询报告”，一张表格。
+
+    表头使用 th、数据使用 td；列名、列顺序与行顺序与查询结果一致，
+    零行结果仍渲染表头。NULL 单元格写入 null_text（默认空），空字符串
+    与恰好同形的普通文本不额外转换，其他值按 str 转文本后统一 HTML
+    转义。页面不引用任何外部资源，可直接离线打开。
+    """
+    parts = [
+        "<!DOCTYPE html>\n",
+        '<html lang="zh-CN">\n',
+        "<head>\n",
+        '<meta charset="utf-8">\n',
+        "<title>查询报告</title>\n",
+        "<style>\n",
+        "table{border-collapse:collapse;}\n",
+        "th,td{border:1px solid #666;padding:4px 8px;white-space:pre-wrap;}\n",
+        "</style>\n",
+        "</head>\n",
+        "<body>\n",
+        "<h1>查询报告</h1>\n",
+        "<table>\n",
+        "<thead>\n",
+        "<tr>",
+    ]
+    for name in headers:
+        parts.append("<th>%s</th>" % html_text(str(name)))
+    parts.append("</tr>\n</thead>\n<tbody>\n")
+    for row in rows:
+        parts.append("<tr>")
+        for value in row:
+            text = null_text if value is None else str(value)
+            parts.append("<td>%s</td>" % html_text(text))
+        parts.append("</tr>\n")
+    parts.append("</tbody>\n</table>\n</body>\n</html>\n")
+    return "".join(parts)
+
+
+def export_html(db_path, sql_text, output_path, params=None, null_text=""):
+    """执行查询并将结果独占写入目标 HTML 报告，返回数据行数（不含表头）。
+
+    输入、参数与 null_text 规则与 export_csv 完全相同：params 为可选的
+    名称->文本 参数字典，值只绑定不拼接；null_text 必须是字符串，NULL
+    单元格写入该文本（默认空字符串，即空单元格），空字符串与同形普通
+    文本不额外转换，其他值按 str 转文本。
+
+    输出为独立的 UTF-8 HTML 页面（声明字符编码、标题“查询报告”、一张
+    表格），零行结果仍保留表头并返回 0；列名与单元格中的 &、<、>、双
+    引号、单引号按文字转义。源库缺失或无效、SQL 或参数不合法、查询执行
+    或求值失败、输出目录不存在、目标已存在时均抛 ValueError 且不创建
+    报告，既有文件原字节不变；写入失败同样抛 ValueError，并清理本次
+    新建的半成品。
+    """
+    if not isinstance(null_text, str):
+        raise ValueError(
+            "null_text 必须是字符串，收到 %s" % type(null_text).__name__
+        )
+    headers, rows = _run_select(db_path, sql_text, output_path, params)
+
+    def write_body(f):
+        f.write(render_html(headers, rows, null_text))
+
+    _write_new_file(output_path, write_body)
     return len(rows)
 
 
@@ -463,14 +585,20 @@ def parse_param_options(items, parser):
 
 def parse_args(argv):
     parser = _Parser(
-        description="对 SQLite 执行一条只读 SELECT 并导出带列名的 CSV"
+        description="对 SQLite 执行一条只读 SELECT 并导出带列名的 CSV 或 HTML 报告"
     )
     parser.add_argument("--db", required=True, help="已有 SQLite 数据库文件路径")
     parser.add_argument("--sql", help="一条 SELECT 查询文本")
     parser.add_argument(
         "--sql-file", help="包含一条 SELECT 查询的 UTF-8 文件路径（允许一个 BOM）"
     )
-    parser.add_argument("--output", required=True, help="输出 CSV 路径（不得已存在）")
+    parser.add_argument("--output", required=True, help="输出路径（不得已存在）")
+    parser.add_argument(
+        "--format",
+        choices=("csv", "html"),
+        default="csv",
+        help="报告格式：csv（默认）或 html；输出类型只由该选项决定",
+    )
     parser.add_argument(
         "--param",
         action="append",
@@ -481,7 +609,7 @@ def parse_args(argv):
         "--null-text",
         metavar="MARKER",
         default="",
-        help="SQL NULL 在 CSV 中的导出标记，默认为空字段；标记原样写入，可含空格、逗号、引号与换行",
+        help="SQL NULL 的导出标记，默认为空；CSV 中为空字段，HTML 中为空单元格",
     )
     args = parser.parse_args(argv)
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
@@ -500,8 +628,10 @@ def main(argv=None):
             sql_text = read_sql_file(args.sql_file)
         except ValueError as exc:
             die(str(exc))
+    # 输出类型只由 --format 决定，与输出路径后缀无关
+    exporter = export_html if args.format == "html" else export_csv
     try:
-        row_count = export_csv(
+        row_count = exporter(
             args.db,
             sql_text,
             args.output,
