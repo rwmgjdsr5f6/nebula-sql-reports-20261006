@@ -1,0 +1,415 @@
+终端预览说明：--preview / preview_csv 的取数与 CSV 输出路径
+=========================================================
+
+- 编写日期：2026-10-07
+- 适用源码：当前目录下的 report.py、query.sql、test_preview.py（工作区提交
+  a9459a6）
+- 文档性质：
+  1. 本文全部行为结论按当前 report.py 源码静态核对，括注的“源码位置”均
+     指向当前 report.py 的行号；query.sql 引述指向当前 query.sql 的行号。
+  2. 凡写“已有断言”之处，指 test_preview.py 中已经写出的断言（给出测试
+     名称与行号区间），它们是依据而非实测记录；本文未运行
+     python -m unittest，也未手工执行下面任何一条示例命令或函数调用。
+     下文示例的返回值、退出码、标准输出/错误均为“按当前源码推导的
+     预期”，不是实测结果。
+  3. 本次交付仅新增本文档；产品源码（report.py）、测试（test_preview.py、
+     test_report.py）、query.sql、README.md 与既有两份说明文档均不修改。
+
+
+一、样例库需自行准备（沿用 test_preview.py 的 people/notes）
+------------------------------------------------------------
+
+本文样例沿用 test_preview.py 在临时目录中现场准备的同一组合成库，建表与
+插数见 test_preview.py:76-98（准备入口在 setUp，test_preview.py:50-54）：
+
+    people(id INTEGER PRIMARY KEY, name TEXT NOT NULL)      -- 79-82
+    notes(person_id INTEGER PRIMARY KEY, note TEXT)         -- 83-86
+
+两条记录（test_preview.py:87-95）：
+
+    people: (1, '小明')、(2, '小红')
+    notes:  (1, NULL)、(2, '中文,含"引号"')
+
+第二人备注的常量 NOTE_VALUE = '中文,含"引号"'（test_preview.py:32），同时
+包含中文、逗号与双引号，用于验证 CSV 解析后能完整还原。
+
+sample.sqlite 不是仓库附带文件：.gitignore 忽略 *.sqlite（.gitignore:6），
+测试一律在临时目录建库、用例结束即清理（test_preview.py:51-52、74）。
+下文命令假设你已按上述结构在当前目录自行准备好 sample.sqlite，例如：
+
+    sqlite3 sample.sqlite \
+      "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL);" \
+      "CREATE TABLE notes (person_id INTEGER PRIMARY KEY, note TEXT);" \
+      "INSERT INTO people VALUES (1,'小明'),(2,'小红');" \
+      "INSERT INTO notes VALUES (1,NULL),(2,'中文,含\"引号\"');"
+
+
+二、query.sql 与预览所用查询
+----------------------------
+
+当前 query.sql 全文 4 行（query.sql:1-4），结尾分号后有一个换行：
+
+    第 1 行  SELECT p.name AS 姓名, n.note AS 备注
+    第 2 行  FROM people p JOIN notes n ON p.id = n.person_id
+    第 3 行  WHERE p.name = :who
+    第 4 行  ORDER BY p.id;
+
+其中 :who（query.sql:3）是唯一的命名参数占位符；输出列名是中文别名
+“姓名”“备注”。首尾空白与单个结尾分号属于允许形态：切分语句时统一
+strip（report.py:151、159），单条 SELECT 加至多一个尾分号的判定在
+report.py:206-214。
+
+预览的函数入口是 preview_csv(db_path, sql_text, limit, params=None,
+null_text="")（report.py:493），接收的是 SQL 文本而非文件路径；命令行
+的 --sql-file 由 main 先调 read_sql_file（report.py:348-367，UTF-8
+解码、允许开头恰一个 BOM）取得文本后再传入（report.py:717-722）。
+
+
+三、预览主路径：从查询来源到终端 CSV
+------------------------------------
+
+命令行从 parse_args 到 preview_csv 严格按下列顺序执行，任一步失败，其后
+步骤都不执行：
+
+  顺序  步骤                                            源码位置
+  ----  ------------------------------------------------  ---------------
+   1    命令行解析（仅命令行）：--db 必填（651）；         report.py:
+        --sql 与 --sql-file 必须恰好选一个（690-691）；    647-711
+        --param 在第一个等号处拆成名称/值，名称非法与
+        同名重复在此拒绝（parse_param_options，
+        624-644，于 710 调用）。
+   2    预览专属参数校验：args.preview < 1 拒绝            report.py:
+        （694-695）；与 --output 冲突（696-697）；         692-701
+        --format html 冲突（698-699）；显式
+        --description（即使为空）冲突（700-701）。
+        参数错误经 _Parser.error（619-621）→ die，
+        退出码 1，发生在读文件与开库之前。
+   3    确定查询来源：--sql 直接用文本（716）；             report.py:
+        --sql-file 调 read_sql_file 读取（348-367），      716-722
+        文件只被读取、绝不改写；读文件失败直接 die
+        （719-722），此时不接触源库。
+   4    main 见 args.preview 非空即进入预览分支，调用       report.py:
+        preview_csv（724-732），成功后直接 return 0        724-733
+        （733），不经过导出成功提示（758 不可达）。
+   5    preview_csv 内：limit 必须是非布尔正整数           report.py:
+        （507-508）；null_text 必须是字符串                507-512
+        （509-512）。
+   6    校验参数字典（513；validate_params 259-277）：      report.py:
+        None 放行；否则须为 str->str 字典，键名合法、      513、
+        值必须是字符串。                                   259-277
+   7    SQL 白名单校验（514）：剥注释、引号外按分号切分，   report.py:
+        首关键字必须为 SELECT，仅允许一条语句加至多       514、
+        一个尾分号（validate_single_select 201-236）。     201-236
+   8    参数绑定核对（515；bind_params 324-345）：扫占位    report.py:
+        符（find_placeholders 280-321，跳过字符串与        515、
+        注释）；? 与 ?N 位置占位符拒绝（332-335）；         280-345
+        查询引用而未提供的参数拒绝（343-344）；未被
+        引用的合法参数忽略（338-345）。
+   9    以只读 URI（file:...?mode=ro）打开源库（517；       report.py:
+        open_readonly 370-383），并查询 sqlite_master       517、
+        强制解析文件头（378）；库缺失不会创建。            370-383
+  10    取数（519；_fetch_rows 415-438）：有绑定字典时      report.py:
+        cursor.execute(语句, 绑定)（428），无占位符才       519、
+        execute(语句)（426）；执行期错误包装为             415-438
+        ValueError（429-430）；由 cursor.description
+        取列名（431-433）；随后 fetchall 取回全部
+        结果行（435），求值期错误同样包装为
+        ValueError（436-437）。
+  11    关闭连接：finally 中 conn.close()，异常时也关闭     report.py:
+                                                           520-521
+  12    全部结果求值成功后才开始输出：csv.writer 包装        report.py:
+        sys.stdout（524）；先无条件写一行表头（525）；     523-529
+        再对 rows[:limit] 切片（526）逐行写出
+        （527-528），数据单元格为 None（SQL NULL）时
+        写 null_text、其余值原样写；返回实际写出的
+        数据行数 len(shown)（529）。
+  13    回到 main：预览成功 return 0（733）；preview_csv     report.py:
+        抛出的 ValueError 由 752-753 捕获交 die：          67-70、
+        标准错误输出“错误: …”（69），退出码 1（70）。      733、752-753
+
+注意：预览不走 export_csv/export_html 共用的 _execute_query
+（report.py:386-412），因此其中的输出目录检查、输出目标占用预查
+（report.py:401-405）不适用于预览；preview_csv 把同样的输入校验内联在
+507-515 行，而它没有输出文件，也就没有任何建文件步骤。
+
+命令行选项与函数参数的一一对应（main 的调用实参见 report.py:726-732）：
+
+    --db sample.sqlite            -> db_path="sample.sqlite"
+    --sql-file query.sql          -> sql_text=read_sql_file("query.sql")
+    --sql "SELECT ..."            -> sql_text="SELECT ..."（不经读文件）
+    --preview 1                   -> limit=1
+    --param who=小明              -> params={"who": "小明"}
+    --null-text 未填写            -> null_text="未填写"
+    （省略 --format 即 csv；预览不接受 --output）
+
+
+四、完整成功示例（按源码推导的预期，非实测）
+--------------------------------------------
+
+命令（在已准备好 sample.sqlite、且含 query.sql 的目录执行）：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --param who=小明 --null-text 未填写 --preview 1
+
+等价的函数调用（SQL 文本来自 read_sql_file，与 main 的做法一致）：
+
+    import report
+    sql_text = report.read_sql_file("query.sql")
+    count = report.preview_csv(
+        "sample.sqlite", sql_text, 1,
+        params={"who": "小明"}, null_text="未填写",
+    )
+    # count == 1
+
+推导依据：
+
+1. query.sql 通过单条 SELECT 校验（顺序 7）；:who 由 params 提供、绑定
+   核对通过（顺序 8），值经 cursor.execute(statement, bound) 绑定
+   （report.py:428），WHERE p.name = '小明' 只命中 id=1 一行。
+2. fetchall 取回该一行（report.py:435），其备注为 SQL NULL（Python 端
+   None），写出时替换为标记“未填写”（report.py:528，转换表达式与文件
+   导出 export_csv 的 report.py:485 相同）。
+3. 标准输出内容用 csv.reader 解析后恰为：
+
+       [["姓名", "备注"], ["小明", "未填写"]]
+
+   表头来自 cursor.description（report.py:433）并在数据行之前无条件写入
+   （report.py:525）；本例两行字段均不含逗号、引号，无需引号引用。
+4. 函数返回值 count == 1：写出的数据行数（不含表头），len(shown)
+   （report.py:529）。
+5. 命令行退出码 0：预览分支 return 0（report.py:733）。
+6. 标准错误为空：成功路径不向 stderr 写任何内容；且不追加成功提示——
+   预览分支在 report.py:733 直接返回，导出路径的
+   “已导出 N 行数据：…”（report.py:758）不可达。
+
+已有断言对组成部分的覆盖（精确的“query.sql + --preview 1”组合本身未被
+逐字测试，下列为按组件对应的已写断言）：
+
+- 参数化查询 + 标记“未填写”的函数断言，且 limit=5、期望解析结果正是
+  [["姓名", "备注"], ["小明", "未填写"]]、返回 1：
+  test_function_param_query_with_null_marker（test_preview.py:193-201）。
+- 命令行 --sql 与带 BOM 查询文件两种来源、--param who=小明
+  --null-text 未填写 --preview 5：退出 0、stderr 为空、解析结果相同、
+  两入口 stdout 逐字节一致：
+  test_cli_param_query_via_sql_and_bom_file_same_result
+  （test_preview.py:259-277；测试用查询文件是 setUp 现场写入的 BOM 文件，
+  test_preview.py:56-58，不是仓库的 query.sql）。
+- --preview 1 只出一行、退出 0、stderr == ""、stdout 不含“已导出”：
+  test_cli_preview_one_row_exit_zero_csv_only
+  （test_preview.py:231-240；该用例用无参数 JOIN_SQL，NULL 取默认空字段，
+  故第二列为 ""）。
+
+
+五、姓名不存在：只输出表头，行数 0，退出仍为 0
+----------------------------------------------
+
+把参数换成库中不存在的姓名，例如：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --param who=不存在 --null-text 未填写 --preview 1
+
+按源码推导：WHERE 不命中，fetchall 得到空列表（report.py:435）；表头在
+数据循环之前无条件写入（report.py:525），shown = rows[:1] 为空切片
+（report.py:526-527），故标准输出经 csv.reader 解析恰为
+[["姓名", "备注"]]；preview_csv 返回 0（report.py:529），命令行退出码
+仍为 0（report.py:733），标准错误为空，同样没有成功提示。
+
+静态预期与已写断言的区分：test_preview.py 没有“参数值匹配不到任何人”的
+逐字用例；最接近的已写断言是零行结果只保留表头、返回 0 的函数用例
+test_function_zero_rows_keeps_header_and_returns_zero
+（test_preview.py:168-177），但其筛选条件是 WHERE p.id < 0 而非参数
+未命中；参数筛选机制本身由 test_function_param_query_with_null_marker
+（193-201）与命令行参数用例（259-277）覆盖。命令行零行场景在
+test_preview.py 中没有对应用例，本节命令行结论纯属按源码推导。
+
+
+六、N 只限制展示行数；CSV 规则；不建文件、不改源库与查询文件
+------------------------------------------------------------
+
+1. N 只在输出端切片：shown = rows[:limit]（report.py:526），不会向 SQL
+   文本注入任何 LIMIT；查询自身的筛选、排序与 LIMIT 语义原样保留。
+   - N 大于结果行数时全部显示：JOIN_SQL 共 2 行，limit=10 返回 2
+     （test_function_limit_above_result_count_returns_two，
+     test_preview.py:157-166）。
+   - 查询自带 ORDER BY p.id DESC LIMIT 1 时只显示小红一行，排序与 LIMIT
+     由 SQL 决定而非 N：test_function_descending_with_limit_one_shows_
+     xiaohong（test_preview.py:179-191）。
+2. 特别澄清：N 不限制取数数量。_fetch_rows 总是 cursor.fetchall() 取回
+   全部结果（report.py:435），切片发生在取数与连接关闭之后
+   （report.py:526）。因此不应理解为“预览只从数据库读取 N 行”——第七节
+   的整数溢出就是“N=1 仍要对全部结果求值”的直接反证。
+3. CSV 规则与文件导出相同：csv.writer 默认 excel 方言（report.py:524，
+   与 export_csv 的 report.py:481 同一写法）。小红备注
+   '中文,含"引号"' 经 csv.reader 完整还原为一个字段：函数用例
+   test_function_limit_above_result_count_returns_two（157-166）；命令行
+   用例 test_cli_default_format_matches_explicit_csv
+   （test_preview.py:242-257）同时断言默认格式与显式 --format csv 的
+   标准输出逐字节一致（253）。NULL 仅按 null_text 替换（528），非空值、
+   列名、列顺序与行顺序不受影响。
+4. 预览不创建报告或临时文件，源库与查询文件保持不变。这一点有测试夹具
+   层面的统一断言：tearDown 中重新以只读方式打开源库，核对两表结构与
+   全部数据与准备基线一致（test_preview.py:68；快照逻辑 100-117），
+   核对临时目录文件清单与基线一致（70；清单逻辑 119-125），并逐字节
+   核对查询文件未变（72-73）；命令行参数用例还额外复核了查询文件字节
+   （test_preview.py:275-277）。源码侧依据：只读 URI 开库
+   （report.py:372-378）、查询文件只以二进制读方式打开
+   （report.py:355-356）、预览路径全程无 open(..., "w"/"x") 调用
+   （524 行的 csv.writer 只包装 sys.stdout）。
+
+
+七、为什么预览一行也可能整体失败：整数溢出与“先取完再输出”
+-----------------------------------------------------------
+
+使用如下查询（test_preview.py:42 的常量 OVERFLOW_SQL）：
+
+    SELECT 1 AS 数值 UNION ALL SELECT abs(-9223372036854775808)
+
+第一项 SELECT 1 完全合法；第二项 abs(-9223372036854775808) 的数学结果
+是 2^63，超出 64 位有符号整数范围，SQLite 在对该行求值时抛出
+“integer overflow”。
+
+按当前源码的失败时序：
+
+1. limit=1 通过正整数校验（report.py:507-508），SQL 通过单条 SELECT
+   校验（514），无参数（bind_params 返回 None，report.py:336-337），
+   只读开库成功（517）。
+2. cursor.execute(statement) 成功（report.py:426）——语句开始执行阶段
+   尚不能暴露第二行的求值错误；列名“数值”由 description 取得
+   （report.py:433）。
+3. cursor.fetchall()（report.py:435）在取回第二项结果时触发 sqlite3.Error，
+   被 436-437 捕获并统一包装为
+   ValueError("SQL 执行失败：…integer overflow…")（包装格式见
+   report.py:437；两个判定子串的常量见 test_preview.py:43-44）。
+4. 连接在 finally 中照常关闭（report.py:520-521）。csv.writer 在
+   fetchall 成功之后才创建（report.py:523-524），因此此刻标准输出尚未
+   写入任何内容，连表头都不会出现——不存在“部分预览”。
+5. 函数入口：preview_csv 抛 ValueError。已有断言
+   test_function_overflow_raises_valueerror_empty_stdout
+   （test_preview.py:217-227）：assertRaises(ValueError)、异常消息同时
+   包含“SQL 执行失败”和“integer overflow”、重定向到缓冲区的标准输出
+   为 ""（227）。
+6. 命令行：
+
+       python report.py --db sample.sqlite \
+           --sql "SELECT 1 AS 数值 UNION ALL SELECT abs(-9223372036854775808)" \
+           --preview 1
+
+   ValueError 由 main 的 except 捕获交 die（report.py:752-753、67-70）：
+   退出码 1（70）；标准输出为空（758 不可达）；标准错误包含“SQL 执行
+   失败”与“integer overflow”（“错误: ”前缀来自 report.py:69，完整
+   逐字文本按源码推导）。已有断言
+   test_cli_overflow_exit_one_stderr_reason_empty_stdout
+   （test_preview.py:333-341）：returncode == 1、stderr 含两个子串、
+   stdout == ""。
+
+一般结论：当前流程是“先取完全部结果，再开始输出”，任一后续行在
+fetchall 期间求值失败，都会拒绝整个结果，即使第一行本身毫无问题、即使
+N=1。
+
+
+八、拒绝情形汇总（函数 ValueError；命令行退出 1、标准输出为空）
+----------------------------------------------------------------
+
+A. 函数 preview_csv 的非法行数（report.py:507-508）
+
+   条件 not isinstance(limit, int)、isinstance(limit, bool) 或
+   limit < 1 任一成立即抛 ValueError("preview 行数必须是正整数，
+   收到 %r")。零、负数、布尔值、非整数全覆盖：
+
+       for bad_limit in (0, -1, True, "2", 2.5)
+
+   已有断言 test_function_invalid_limit_raises_valueerror_empty_stdout
+   （test_preview.py:205-213）：五种取值均 assertRaises(ValueError)，
+   且重定向的标准输出为 ""（213）。此校验是 preview_csv 的第一步
+   （507 在 513-519 之前），非法行数时不会校验参数、不会打开数据库。
+
+B. 命令行缺少行数或行数非法（report.py:657-663、694-695、619-621）
+
+   --preview 以 type=int 注册（report.py:659）：
+   - 缺少值（--preview 后无参数）：argparse 报 “expected one argument”，
+     经 _Parser.error 处理；
+   - 非整数（如 abc、2.5）：argparse 的 int 转换失败，同一路径；
+   - 零与负数（0、-2）：argparse 能转为 int，再由
+     report.py:694-695 的 args.preview < 1 判定拒绝。
+   三种情况都走 _Parser.error（619-621）：先 print_usage 向 stderr 写
+   一行用法（620），再由 die 写“错误: 参数错误：…”（621、69），退出
+   码 1（argparse 默认的退出码 2 被本类改写为 1，说明见 617-618）。
+   已有断言 test_cli_invalid_preview_count_exit_one
+   （test_preview.py:281-295），含“缺值/零/负数/非整数”四个 subTest：
+   returncode == 1、stderr 含“错误”、stdout == ""。
+
+C. 预览与导出类选项冲突（report.py:692-701）
+
+   - 与 --output 同时提供：696-697 拒绝。已有断言
+     test_cli_preview_with_output_rejected_no_file
+     （test_preview.py:299-309）：退出 1、stderr 含“错误”、stdout 为空，
+     并显式断言目标输出文件不存在（309）。
+   - 与 --format html 同时提供：698-699 拒绝（706-709 另有
+     “description 仅配 html”的通用判定）。已有断言
+     test_cli_preview_with_format_html_rejected
+     （test_preview.py:311-318）。
+   - 与显式 --description 同时提供（即使传空字符串）：700-701 拒绝；
+     命令行以 default=None 区分“未提供”与“提供空串”（report.py:685）。
+     已有断言 test_cli_preview_with_description_rejected
+     （test_preview.py:320-329），含“非空说明/空说明”两个 subTest。
+
+   以上三类均为退出码 1、标准输出为空。“不建文件”的把握程度需区分：
+   拒绝全部发生在 parse_args 内（692-701），早于读取查询文件
+   （report.py:717-722）与打开源库（preview_csv report.py:517），按
+   执行顺序静态推导不会产生任何文件；但 test_preview.py 中只有
+   --output 冲突用例显式断言了文件不存在（309），html 与 description
+   两个用例只断言退出码、stderr 与 stdout，未断言文件系统。
+
+   另注：B、C 两类都属参数解析错误，stderr 含用法行；而第七节的运行期
+   ValueError 由 main 的 except 直接交 die（report.py:752-753），stderr
+   只有“错误: …”一行，不含用法行。
+
+
+九、行为—源码—已有断言速查
+--------------------------
+
+行为                                      源码位置            已有断言（test_preview.py）
+----------------------------------------  ------------------  ------------------------------
+--sql/--sql-file 恰选一个                  report.py:690-691   （经各正常用例间接覆盖）
+查询文件 UTF-8/单 BOM、只读不改写          report.py:348-367   259-277、275-277；夹具 72-73
+单条 SELECT 白名单                         report.py:201-236   （非法 SQL 的专项在 test_report.py）
+占位符扫描/位置符拒绝/缺参拒绝             report.py:280-345   参数正常绑定 193-201、259-277
+params 类型与值字符串校验                  report.py:259-277   （专项在 test_report.py）
+只读开库、缺失不创建                       report.py:370-383   夹具核对 68、100-117
+execute + 取 description + fetchall        report.py:415-438   150-201、217-227
+连接在 finally 中关闭                      report.py:520-521   （源码静态结论，无专门断言）
+表头无条件输出、零行只剩表头               report.py:525       168-177
+N 仅 rows[:limit] 切片                     report.py:526       157-166、179-191
+查询 ORDER BY/LIMIT 语义保留               report.py:514、526  179-191
+NULL 替换 null_text、非空值不动            report.py:528       193-201、259-277
+中文/逗号/引号 CSV 还原                    report.py:524       157-166、242-257
+返回值为实际展示行数                       report.py:529       150-166、193-201
+成功退出 0、stderr 空、无“已导出”提示      report.py:733、758  231-240、242-257、259-277
+求值失败整体拒绝、stdout 为空              report.py:435-437、 217-227、
+                                          523-524             333-341
+函数非法 limit（0/-1/True/"2"/2.5）        report.py:507-508   205-213
+CLI 缺值/零/负数/非整数                    report.py:619-621、 281-295
+                                          659、694-695
+CLI 与 --output 冲突且不建文件             report.py:696-697   299-309
+CLI 与 --format html 冲突                  report.py:698-699   311-318
+CLI 与 --description 冲突（含空串）        report.py:700-701   320-329
+预览不建报告/临时文件、源库与查询文件不变  report.py:517-528   夹具 65-74；275-277
+
+表中“已有断言”列仅表示测试已写出对应检查；本文未运行这些测试。第四节
+的精确 query.sql 命令、第五节的参数未命中命令行结论、第七节的 stderr
+逐字文本，均为按当前源码推导的静态预期。
+
+
+十、范围与未改动项
+------------------
+
+1. 本文只覆盖“确定查询来源 → 行数与参数校验 → 只读开库 → 执行并取回
+   全部结果 → 关闭连接 → 向标准输出写最多 N 行 CSV”这一预览路径，以及
+   --preview 命令行入口与 preview_csv 函数入口的对应关系。
+2. 文件导出（export_csv/export_html，report.py:463-613）、--description
+   语义与 HTML 转义不在本文展开；预览与导出共用的校验函数行为以既有
+   《参数查询导出说明.txt》《HTML查询说明导出说明.txt》为准。
+3. 本次交付仅新增《终端预览说明.txt》一个 UTF-8 文本文件；report.py、
+   test_preview.py、test_report.py、query.sql、README.md、两份既有说明、
+   .gitignore 以及仓库中既有的 result.csv、result2.csv 均保持原状；
+   不新增任何命令行选项或函数。
