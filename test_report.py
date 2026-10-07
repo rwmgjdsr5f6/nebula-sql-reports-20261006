@@ -2973,5 +2973,437 @@ class HtmlDescriptionTestCase(unittest.TestCase):
             self.assertEqual(f.read(), original_bytes)
 
 
+# ---- HTML 自定义报告标题（--title / export_html 的 title）----
+# 与验收相同的 people/notes 合成样例：小明备注为 NULL，小红备注含逗号与引号
+TITLE_SQL = (
+    "SELECT p.name AS 姓名, n.note AS 备注 "
+    "FROM people p JOIN notes n ON p.id=n.person_id "
+    "WHERE p.name = :who ORDER BY p.id"
+)
+TITLE_TEXT = "小明备注"
+# 含首尾空白与内部空白的标题：首尾空白去除，中文与内部空白保留
+TITLE_PADDED = " \t 小明  备注 \n "
+TITLE_PADDED_STRIPPED = "小明  备注"
+# 含 HTML 特殊字符的标题：&、<、>、单双引号一律按文字转义，不产生标签或脚本
+TITLE_SPECIAL = "小<明> & \"备注\" '报告'"
+TITLE_SPECIAL_ESCAPED = html.escape(TITLE_SPECIAL)
+# 选中小明时的完整表格期望：表头 + 一行“小明”与空单元格（默认空值标记）
+TITLE_EXPECTED_ROWS = [
+    [("th", "姓名"), ("th", "备注")],
+    [("td", "小明"), ("td", "")],
+]
+
+
+class HtmlTitleTestCase(unittest.TestCase):
+    """export_html 的 title 与 --title 命令行选项的回归测试。
+
+    每个用例独立准备临时目录与 people/notes 样例库（小明备注为 NULL，
+    小红备注为含逗号、双引号的中文）；tearDown 重新只读打开源库，核对
+    两表结构及全部数据相对基线零变化。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "sample.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，tearDown 中逐一核对
+        self._baseline = self._snapshot_db()
+
+    def tearDown(self):
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE people ("
+                "id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE notes ("
+                "person_id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                [(1, "小明"), (2, "小红")],
+            )
+            conn.executemany(
+                "INSERT INTO notes (person_id, note) VALUES (?, ?)",
+                [(1, None), (2, NOTE_VALUE)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            people = conn.execute(
+                "SELECT id, name FROM people ORDER BY id"
+            ).fetchall()
+            notes = conn.execute(
+                "SELECT person_id, note FROM notes ORDER BY person_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "people": people, "notes": notes}
+
+    @staticmethod
+    def _read_html(path):
+        with open(path, "r", encoding="utf-8", newline="") as f:
+            text = f.read()
+        parser = _HtmlTableParser()
+        parser.feed(text)
+        parser.close()
+        return text, parser.tables
+
+    def _run_cli(self, output, sql=None, sql_file=None,
+                 extra=(), fmt="html"):
+        cmd = [sys.executable, REPORT_PY, "--db", self.db_path]
+        if sql is not None:
+            cmd += ["--sql", sql]
+        if sql_file is not None:
+            cmd += ["--sql-file", sql_file]
+        cmd += ["--output", output]
+        if fmt is not None:
+            cmd += ["--format", fmt]
+        cmd += list(extra)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    def _assert_titles(self, text, escaped_title):
+        """浏览器标题与主标题两处均为给定（已转义）标题，且只出现这两次。"""
+        self.assertIn("<title>%s</title>" % escaped_title, text)
+        self.assertIn("<h1>%s</h1>" % escaped_title, text)
+        # 标题不进入查询说明、表头或数据行：整页恰好出现这两次
+        self.assertEqual(text.count(escaped_title), 2)
+
+    # -- 函数入口：标题同时用于两处标题位置 ----------------------------------
+
+    def test_function_title_used_in_both_positions(self):
+        out = os.path.join(self.tmpdir, "titled.html")
+        count = report.export_html(
+            self.db_path, TITLE_SQL, out,
+            params={"who": "小明"}, title=TITLE_TEXT,
+        )
+        # 返回值仍为数据行数，标题不改变行数
+        self.assertEqual(count, 1)
+        text, tables = self._read_html(out)
+        self._assert_titles(text, TITLE_TEXT)
+        # 表头依次为姓名、备注，唯一数据行为小明和空单元格
+        self.assertEqual(tables, [TITLE_EXPECTED_ROWS])
+
+    def test_function_title_stripped_keeps_internal_whitespace(self):
+        out = os.path.join(self.tmpdir, "padded.html")
+        count = report.export_html(
+            self.db_path, TITLE_SQL, out,
+            params={"who": "小明"}, title=TITLE_PADDED,
+        )
+        self.assertEqual(count, 1)
+        text, _ = self._read_html(out)
+        # 首尾空白去除，中文与内部连续空白保留
+        self._assert_titles(text, TITLE_PADDED_STRIPPED)
+
+    def test_function_title_escaped_in_both_positions(self):
+        out = os.path.join(self.tmpdir, "special.html")
+        count = report.export_html(
+            self.db_path, TITLE_SQL, out,
+            params={"who": "小明"}, title=TITLE_SPECIAL,
+        )
+        self.assertEqual(count, 1)
+        text, tables = self._read_html(out)
+        # 两处标题均按文字转义：&、<、>、单双引号不产生额外标签或脚本
+        self._assert_titles(text, TITLE_SPECIAL_ESCAPED)
+        self.assertNotIn(TITLE_SPECIAL, text)
+        # 表格内容不受标题影响
+        self.assertEqual(tables, [TITLE_EXPECTED_ROWS])
+
+    # -- 函数入口：省略标题与显式默认标题逐字节一致 ----------------------------
+
+    def test_omitted_and_default_title_byte_identical(self):
+        out_plain = os.path.join(self.tmpdir, "plain.html")
+        out_default = os.path.join(self.tmpdir, "default.html")
+        count_plain = report.export_html(
+            self.db_path, TITLE_SQL, out_plain, params={"who": "小明"},
+        )
+        count_default = report.export_html(
+            self.db_path, TITLE_SQL, out_default,
+            params={"who": "小明"}, title="查询报告",
+        )
+        self.assertEqual(count_plain, 1)
+        self.assertEqual(count_default, 1)
+        with open(out_plain, "rb") as f:
+            plain_bytes = f.read()
+        with open(out_default, "rb") as f:
+            self.assertEqual(f.read(), plain_bytes)
+        # 省略标题时两处标题仍为“查询报告”
+        text, tables = self._read_html(out_plain)
+        self._assert_titles(text, "查询报告")
+        self.assertEqual(tables, [TITLE_EXPECTED_ROWS])
+
+    # -- 函数入口：筛选不到记录时保留自定义标题与表头 --------------------------
+
+    def test_function_zero_rows_keeps_title_and_header(self):
+        out = os.path.join(self.tmpdir, "zero.html")
+        count = report.export_html(
+            self.db_path, TITLE_SQL, out,
+            params={"who": "不存在"}, title=TITLE_TEXT,
+        )
+        self.assertEqual(count, 0)
+        text, tables = self._read_html(out)
+        self._assert_titles(text, TITLE_TEXT)
+        # 保留表头，没有数据行
+        self.assertEqual(tables, [[[("th", "姓名"), ("th", "备注")]]])
+
+    # -- 函数入口：标题与说明、空值标记并存 ------------------------------------
+
+    def test_function_title_with_description_and_null_text(self):
+        out = os.path.join(self.tmpdir, "combo.html")
+        count = report.export_html(
+            self.db_path, TITLE_SQL, out,
+            params={"who": "小明"}, null_text="未填写",
+            description=DESC_TEXT, title=TITLE_TEXT,
+        )
+        self.assertEqual(count, 1)
+        text, tables = self._read_html(out)
+        self._assert_titles(text, TITLE_TEXT)
+        # 说明仍显示在主标题之后、表格之前；空值标记仍替换 NULL
+        head_end = text.index("<h1>%s</h1>" % TITLE_TEXT)
+        desc_pos = text.index(DESC_ESCAPED)
+        table_pos = text.index("<table>")
+        self.assertLess(head_end, desc_pos)
+        self.assertLess(desc_pos, table_pos)
+        self.assertEqual(
+            tables,
+            [[[("th", "姓名"), ("th", "备注")],
+              [("td", "小明"), ("td", "未填写")]]],
+        )
+
+    # -- 函数入口：非字符串标题与空白标题被拒绝 --------------------------------
+
+    def test_function_non_string_title_rejected_without_file(self):
+        for bad in (None, 1, True, ["标题"]):
+            with self.subTest(title=bad):
+                out = os.path.join(self.tmpdir, "bad_title_%r.html" % (bad,))
+                self.assertFalse(os.path.exists(out))
+                with self.assertRaises(ValueError):
+                    report.export_html(
+                        self.db_path, TITLE_SQL, out,
+                        params={"who": "小明"}, title=bad,
+                    )
+                # 拒绝路径绝不产生目标文件
+                self.assertFalse(os.path.exists(out))
+
+    def test_function_blank_title_rejected_without_file(self):
+        for blank in ("", "   ", " \t\n "):
+            with self.subTest(title=blank):
+                out = os.path.join(self.tmpdir, "blank_title.html")
+                self.assertFalse(os.path.exists(out))
+                with self.assertRaises(ValueError):
+                    report.export_html(
+                        self.db_path, TITLE_SQL, out,
+                        params={"who": "小明"}, title=blank,
+                    )
+                self.assertFalse(os.path.exists(out))
+
+    # -- 函数入口：输出目标已存在 --------------------------------------------
+
+    def test_function_existing_target_rejected_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "existing.html")
+        original_bytes = "已有内容，不得变化\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original_bytes)
+
+        with self.assertRaises(ValueError) as ctx:
+            report.export_html(
+                self.db_path, TITLE_SQL, out,
+                params={"who": "小明"}, title=TITLE_TEXT,
+            )
+        self.assertIn("已存在", str(ctx.exception))
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+
+    # -- 命令行：--sql-file 与 --sql 均支持自定义标题 --------------------------
+
+    def _assert_cli_title_success(self, out, proc):
+        """成功路径的公共核对：退出码、成功信息、两处标题与表格内容。"""
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.stdout, "已导出 1 行数据：%s\n" % out)
+        text, tables = self._read_html(out)
+        self._assert_titles(text, TITLE_TEXT)
+        self.assertEqual(tables, [TITLE_EXPECTED_ROWS])
+
+    def test_cli_sql_file_with_title_exports_one_row(self):
+        # 与验收命令同形：--sql-file + --param + --format html + --title
+        sql_path = os.path.join(self.tmpdir, "query.sql")
+        payload = (TITLE_SQL + ";\n").encode("utf-8")
+        with open(sql_path, "wb") as f:
+            f.write(payload)
+        out = os.path.join(self.tmpdir, "titled.html")
+        proc = self._run_cli(
+            out,
+            sql_file=sql_path,
+            extra=["--param", "who=小明", "--title", TITLE_TEXT],
+        )
+        self._assert_cli_title_success(out, proc)
+        # 查询文件只被读取，字节未变
+        with open(sql_path, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_cli_sql_with_title_exports_one_row(self):
+        out = os.path.join(self.tmpdir, "cli_sql_title.html")
+        proc = self._run_cli(
+            out,
+            sql=TITLE_SQL,
+            extra=["--param", "who=小明", "--title", TITLE_TEXT],
+        )
+        self._assert_cli_title_success(out, proc)
+
+    def test_cli_zero_rows_keeps_title_and_header(self):
+        out = os.path.join(self.tmpdir, "cli_zero.html")
+        proc = self._run_cli(
+            out,
+            sql=TITLE_SQL,
+            extra=["--param", "who=不存在", "--title", TITLE_TEXT],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.stdout, "已导出 0 行数据：%s\n" % out)
+        text, tables = self._read_html(out)
+        self._assert_titles(text, TITLE_TEXT)
+        self.assertEqual(tables, [[[("th", "姓名"), ("th", "备注")]]])
+
+    # -- 命令行：显式 --title 只允许 --format html -----------------------------
+
+    def _assert_cli_title_format_rejected(self, out, extra, fmt):
+        self.assertFalse(os.path.exists(out))
+        proc = self._run_cli(out, sql=TITLE_SQL, extra=extra, fmt=fmt)
+        self.assertEqual(proc.returncode, 1)
+        # 标准错误给出错误前缀与仅支持 HTML 的原因
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn("--title", proc.stderr)
+        self.assertIn("html", proc.stderr.lower())
+        # 标准输出为空，不创建目标文件
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    def test_cli_title_with_csv_format_rejected(self):
+        out = os.path.join(self.tmpdir, "title_csv.csv")
+        self._assert_cli_title_format_rejected(
+            out, ["--title", TITLE_TEXT], "csv"
+        )
+
+    def test_cli_title_with_default_format_rejected(self):
+        # 省略 --format 即默认 csv，同样拒绝
+        out = os.path.join(self.tmpdir, "title_default.csv")
+        self._assert_cli_title_format_rejected(
+            out, ["--title", TITLE_TEXT], None
+        )
+
+    def test_cli_title_with_preview_rejected(self):
+        # 预览模式不要求 --output；--preview 与 --title 搭配按参数错误拒绝
+        cmd = [
+            sys.executable,
+            REPORT_PY,
+            "--db",
+            self.db_path,
+            "--sql",
+            TITLE_SQL,
+            "--preview",
+            "1",
+            "--title",
+            TITLE_TEXT,
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn("--title", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_cli_title_csv_rejection_keeps_existing_file(self):
+        # 目标已存在时，格式拒绝发生在任何写操作之前：原字节不变
+        out = os.path.join(self.tmpdir, "title_existing.csv")
+        original_bytes = "已有内容，不得变化\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original_bytes)
+        proc = self._run_cli(
+            out, sql=TITLE_SQL, extra=["--title", TITLE_TEXT], fmt="csv"
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+
+    # -- 命令行：空白标题与缺少标题值 ------------------------------------------
+
+    def test_cli_blank_title_rejected(self):
+        out = os.path.join(self.tmpdir, "blank_title.html")
+        self.assertFalse(os.path.exists(out))
+        proc = self._run_cli(
+            out, sql=TITLE_SQL, extra=["--title", "  \t "],
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn("--title", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    def test_cli_missing_title_value_exit_one_empty_stdout(self):
+        out = os.path.join(self.tmpdir, "cli_no_title_value.html")
+        self.assertFalse(os.path.exists(out))
+        # --title 放在末尾使其后面无值可消费，触发缺值错误
+        cmd = [
+            sys.executable,
+            REPORT_PY,
+            "--db",
+            self.db_path,
+            "--sql",
+            TITLE_SQL,
+            "--output",
+            out,
+            "--format",
+            "html",
+            "--title",
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误", proc.stderr)
+        self.assertIn("--title", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(out))
+
+    # -- 命令行：HTML 路径下输出目标已存在 ------------------------------------
+
+    def test_cli_existing_target_with_title_exit_one_bytes_unchanged(self):
+        out = os.path.join(self.tmpdir, "cli_existing.html")
+        original_bytes = "已有内容，不得变化\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original_bytes)
+        proc = self._run_cli(
+            out,
+            sql=TITLE_SQL,
+            extra=["--param", "who=小明", "--title", TITLE_TEXT],
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("错误: ", proc.stderr)
+        self.assertIn("已存在", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), original_bytes)
+
+
 if __name__ == "__main__":
     unittest.main()
