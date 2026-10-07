@@ -383,12 +383,13 @@ def open_readonly(db_path):
     return conn
 
 
-def _execute_query(db_path, sql_text, output_path, params, null_text):
-    """校验全部输入并以只读方式执行查询，返回 (列名列表, 数据行列表)。
+def _prepare_statement(sql_text, params, null_text):
+    """校验 null_text、参数字典与 SQL 文本，返回 (可执行语句, 绑定字典或 None)。
 
-    汇集 export_csv 与 export_html 共用的拒绝路径：null_text 类型、参数
-    字典、SQL 文本、占位符绑定、输出目录与目标占用、源库打开、查询执行与
-    结果求值。任何失败都抛 ValueError，且此时尚未创建输出文件。
+    汇集 export_csv、export_html 与 preview_csv 共用的输入校验：
+    null_text 必须是字符串；参数必须是 名称->文本 字典且键为合法参数名；
+    SQL 恰为一条 SELECT；占位符与参数对应。任何失败都抛 ValueError，
+    此时尚未打开源库，也未接触输出目标或标准输出。
     """
     if not isinstance(null_text, str):
         raise ValueError(
@@ -397,6 +398,32 @@ def _execute_query(db_path, sql_text, output_path, params, null_text):
     params = validate_params(params)
     statement = validate_single_select(sql_text)
     bound = bind_params(statement, params)
+    return statement, bound
+
+
+def _query_rows(db_path, sql_text, params, null_text):
+    """校验输入并以只读方式执行查询，返回 (列名列表, 数据行列表)。
+
+    全部结果求值成功后本函数才返回；校验、执行或求值失败均抛
+    ValueError，调用方据此保证失败时不产生任何输出。
+    """
+    statement, bound = _prepare_statement(sql_text, params, null_text)
+    conn = open_readonly(db_path)
+    try:
+        return _fetch_rows(conn, statement, bound)
+    finally:
+        conn.close()
+
+
+def _execute_query(db_path, sql_text, output_path, params, null_text):
+    """校验全部输入并以只读方式执行查询，返回 (列名列表, 数据行列表)。
+
+    汇集 export_csv 与 export_html 共用的拒绝路径：在 _prepare_statement
+    的输入校验之外，额外核对输出目录存在且目标未被占用，随后才打开源库、
+    执行查询并求值全部结果。任何失败都抛 ValueError，且此时尚未创建
+    输出文件。
+    """
+    statement, bound = _prepare_statement(sql_text, params, null_text)
 
     output_dir = os.path.dirname(os.path.abspath(output_path))
     if not os.path.isdir(output_dir):
@@ -460,6 +487,20 @@ def _write_output_file(output_path, write_content):
         raise ValueError("无法写入输出文件 %s：%s" % (output_path, exc))
 
 
+def _write_csv_records(fileobj, headers, rows, null_text):
+    """把查询结果按 CSV 规则写入已打开的文本流：表头一条记录，随后每个数据行一条。
+
+    export_csv 与 preview_csv 共用同一份 CSV 表达：列名、列顺序与行
+    顺序与查询结果一致；SQL NULL 写 null_text，其余值（空字符串、零值、
+    与标记同形的普通文本）原样交给 csv 模块按默认方言处理引号与记录
+    分隔符；不额外添加标记或空行。
+    """
+    writer = csv.writer(fileobj)
+    writer.writerow(headers)
+    for row in rows:
+        writer.writerow([null_text if value is None else value for value in row])
+
+
 def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
 
@@ -478,12 +519,7 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     )
 
     def write_csv(f):
-        writer = csv.writer(f)
-        writer.writerow(headers)
-        for row in rows:
-            writer.writerow(
-                [null_text if value is None else value for value in row]
-            )
+        _write_csv_records(f, headers, rows, null_text)
 
     _write_output_file(output_path, write_csv)
 
@@ -502,30 +538,15 @@ def preview_csv(db_path, sql_text, limit, params=None, null_text=""):
     条时全部显示，零行结果只显示表头。列名、列顺序与查询返回的行顺序
     保持一致，查询的筛选、排序和 LIMIT 语义原样保留。SQL NULL 写
     null_text（默认空字段），非空值不额外替换；中文、逗号、引号及换行
-    遵循与文件导出相同的 CSV 规则。
+    遵循与文件导出相同的 CSV 规则（同一份 _write_csv_records 表达）。
     """
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise ValueError("preview 行数必须是正整数，收到 %r" % (limit,))
-    if not isinstance(null_text, str):
-        raise ValueError(
-            "null_text 必须是字符串，收到 %s" % type(null_text).__name__
-        )
-    params = validate_params(params)
-    statement = validate_single_select(sql_text)
-    bound = bind_params(statement, params)
-
-    conn = open_readonly(db_path)
-    try:
-        headers, rows = _fetch_rows(conn, statement, bound)
-    finally:
-        conn.close()
+    headers, rows = _query_rows(db_path, sql_text, params, null_text)
 
     # 全部结果求值成功后才开始写标准输出：失败路径不会留下部分预览
-    writer = csv.writer(sys.stdout)
-    writer.writerow(headers)
     shown = rows[:limit]
-    for row in shown:
-        writer.writerow([null_text if value is None else value for value in row])
+    _write_csv_records(sys.stdout, headers, shown, null_text)
     return len(shown)
 
 
