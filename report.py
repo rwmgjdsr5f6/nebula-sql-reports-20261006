@@ -397,7 +397,14 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
         if cursor.description is None:
             raise ValueError("不支持的语句：仅允许返回结果集的 SELECT")
         headers = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
+        # 结果可能惰性求值：即便 execute 成功，fetchall 期间仍可能因求值
+        # （如整数溢出）抛出 sqlite3.Error。与开始执行阶段统一归类为
+        # ValueError，调用方无需按错误时点分别处理两种异常；此时尚未创建
+        # 输出文件，即使部分结果已可用也不会被当作成功写出。
+        try:
+            rows = cursor.fetchall()
+        except sqlite3.Error as exc:
+            raise ValueError("SQL 执行失败：%s" % exc)
     finally:
         conn.close()
 
