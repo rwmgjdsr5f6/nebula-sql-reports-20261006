@@ -6,6 +6,8 @@
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
         --param who=小红 --param tag=a=b
+    python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
+        --params-file params.json
     python report.py --db DB.sqlite --describe notes
     python report.py --db sample.sqlite --tables
 
@@ -50,6 +52,24 @@ ASCII 字母或下划线，后续仅含 ASCII 字母、数字或下划线。值�
 绑定（数字、null、布尔词不转换类型），只作为数据参与查询，绝不拼接进
 SQL 文本。字符串与注释中的类似文本不算参数；未被查询引用的合法参数
 忽略；缺少查询引用的参数、或使用 ?、?1 位置占位符，均拒绝。
+
+--params-file PATH 指定一个本地 JSON 参数文件，使同一份参数可复用于
+CSV 导出、HTML 导出与终端预览：与 --sql 或 --sql-file 恰选一个的查询
+来源配合，不改变其互斥规则。该选项只能提供一次且路径不能为空；与
+--tables、--describe 混用，或重复提供、缺少路径时，在参数解析阶段即
+拒绝，且绝不读取参数文件。文件按 UTF-8 读取（允许开头恰一个 BOM），
+内容只接受一个 JSON 对象：键遵循与 --param 相同的参数名规则并区分
+大小写，值必须全部为 JSON 字符串；空对象与空字符串值有效，数字、布尔
+值、null、数组与嵌套对象一律拒绝，对象中的重复键也拒绝。字符串解码后
+的中文、首尾空格、换行、等号、引号和分号原样保留，不推断类型，也不
+拼接进 SQL。文件参数先与命令行 --param 合并再按既有规则绑定：同名时
+命令行值覆盖文件值（命令行空字符串同样覆盖非空文件值），与选项在命令
+行上的先后顺序无关；文件中的非法条目会被独立校验，不能借命令行覆盖
+绕过。合并后缺少查询引用的参数或出现位置占位符仍按原规则失败，未被
+引用的合法参数仍忽略。参数文件的读取与校验在读取查询文件、打开源库与
+创建报告之前完成；文件不存在、路径是目录、不可读、编码或 JSON 错误及
+上述结构、内容错误，均以退出码 1、标准输出为空、标准错误以"错误: "
+开头并说明原因结束，失败不创建任何文件。
 
 --null-text MARKER 可指定 SQL NULL 在输出中的导出标记，默认空字符串
 （CSV 中即空字段，HTML 中即空单元格）。标记作为文本原样写入，可为空，
@@ -96,6 +116,7 @@ csv、省略格式或使用 --preview 时按参数错误拒绝，标题缺少文
 import argparse
 import csv
 import html
+import json
 import os
 import re
 import sqlite3
@@ -404,6 +425,104 @@ def read_sql_file(path):
         return data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ValueError("查询文件不是有效的 UTF-8 文本 %s：%s" % (path, exc))
+
+
+class _DuplicateJsonObjectKey(Exception):
+    """object_pairs_hook 内部信号：JSON 对象中出现重复键。"""
+
+
+def _reject_duplicate_json_keys(pairs):
+    """json.loads 的 object_pairs_hook：重复键直接拒绝，否则还原为普通字典。"""
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonObjectKey(key)
+        result[key] = value
+    return result
+
+
+def _json_value_kind(value):
+    """参数文件值的 JSON 类型中文说明，用于非字符串值的拒绝信息。"""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "布尔值"
+    if isinstance(value, int) or isinstance(value, float):
+        return "数字"
+    if isinstance(value, list):
+        return "数组"
+    if isinstance(value, dict):
+        return "嵌套对象"
+    return type(value).__name__
+
+
+def read_params_file(path):
+    """读取 --params-file 参数文件，返回 名称->文本 字典；任何不合法均抛 ValueError。
+
+    文件按 UTF-8 解码，允许开头恰一个 BOM（与 read_sql_file 同一约定）；
+    文件只被读取，绝不改写。内容必须恰为一个 JSON 对象：
+
+    - 顶层不是对象（数组、数字、布尔、null、字符串等）一律拒绝；
+    - 键遵循与 --param 相同的参数名规则（区分大小写），非法键名拒绝；
+    - 值必须全部为 JSON 字符串，数字、布尔值、null、数组与嵌套对象拒绝；
+      空对象与空字符串值有效，字符串解码后的中文、首尾空格、换行、等号、
+      引号和分号原样保留，不做任何类型推断；
+    - 对象中的重复键拒绝（在 JSON 解析阶段即失败，不会留到合并阶段）。
+
+    文件不存在、路径是目录、不可读、编码或 JSON 语法错误同样抛
+    ValueError，由调用方按统一的“错误: …”失败约定处理。
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise ValueError("参数文件不存在：%s" % path)
+    except IsADirectoryError:
+        raise ValueError("参数文件路径是目录而非文件：%s" % path)
+    except OSError as exc:
+        raise ValueError("无法读取参数文件 %s：%s" % (path, exc))
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("参数文件不是有效的 UTF-8 文本 %s：%s" % (path, exc))
+    try:
+        obj = json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)
+    except _DuplicateJsonObjectKey as exc:
+        raise ValueError("参数文件 %s 中存在重复的键：%r" % (path, exc.args[0]))
+    except json.JSONDecodeError as exc:
+        raise ValueError("参数文件 %s 不是合法的 JSON：%s" % (path, exc))
+    if not isinstance(obj, dict):
+        raise ValueError(
+            "参数文件 %s 的内容必须是一个 JSON 对象，收到 %s"
+            % (path, _json_value_kind(obj))
+        )
+    params = {}
+    for name, value in obj.items():
+        try:
+            validate_param_name(name)
+        except ValueError as exc:
+            raise ValueError("参数文件 %s 中的参数名非法：%s" % (path, exc))
+        if not isinstance(value, str):
+            raise ValueError(
+                "参数文件 %s 中参数 %r 的值必须是 JSON 字符串，收到 %s"
+                % (path, name, _json_value_kind(value))
+            )
+        params[name] = value
+    return params
+
+
+def merge_params(file_params, cli_params):
+    """合并文件参数与命令行参数，同名时命令行值覆盖文件值。
+
+    与选项在命令行上的先后顺序无关：先放入文件中的全部条目，再以命令行
+    --param 条目整体覆盖，因此命令行空字符串也能覆盖文件中的非空值。
+    两边都为空（None 或空字典）时返回 None，与未提供任何参数的既有调用
+    形态保持一致；否则返回合并后的新字典，不修改传入的两个字典。
+    """
+    merged = dict(file_params or {})
+    if cli_params:
+        merged.update(cli_params)
+    return merged or None
 
 
 def open_readonly(db_path):
@@ -892,6 +1011,14 @@ def parse_args(argv):
         help="查询命名参数的文本值，可重复；值在第一个等号后原样保留",
     )
     parser.add_argument(
+        "--params-file",
+        action="append",
+        metavar="PATH",
+        help="包含一个 JSON 对象的 UTF-8 参数文件路径（允许一个 BOM）："
+        "键为参数名、值全部为字符串；只能提供一次，与 --param 合并，"
+        "同名时命令行 --param 覆盖文件值",
+    )
+    parser.add_argument(
         "--null-text",
         metavar="MARKER",
         default=None,
@@ -930,6 +1057,8 @@ def parse_args(argv):
             extras.append("--format")
         if args.param:
             extras.append("--param")
+        if args.params_file:
+            extras.append("--params-file")
         if args.null_text is not None:
             extras.append("--null-text")
         if args.description is not None:
@@ -959,6 +1088,8 @@ def parse_args(argv):
             extras.append("--format")
         if args.param:
             extras.append("--param")
+        if args.params_file:
+            extras.append("--params-file")
         if args.null_text is not None:
             extras.append("--null-text")
         if args.description is not None:
@@ -1012,6 +1143,14 @@ def parse_args(argv):
         if args.title.strip() == "":
             parser.error("--title 的标题去除首尾空白后不能为空")
     args.params = parse_param_options(args.param, parser)
+    # --params-file 的结构性规则在读取任何文件之前判定：只能提供一次，
+    # 路径不能为空。重复提供或缺路径属参数错误，此时绝不读取参数文件。
+    # 文件本身的读取与内容校验由 main 在读取查询文件、打开源库之前完成
+    if args.params_file is not None:
+        if len(args.params_file) > 1:
+            parser.error("--params-file 只能提供一次，收到 %d 次" % len(args.params_file))
+        if args.params_file[0] == "":
+            parser.error("--params-file 路径不能为空")
     return args
 
 
@@ -1041,9 +1180,20 @@ def main(argv=None):
         except OSError as exc:
             die("文件错误：%s" % exc)
         return 0
+    # 参数文件的读取与结构/内容校验最先完成：先于读取查询文件、打开源库
+    # 与创建报告，失败时不读取查询文件、不接触源库、不创建任何文件。
+    # 文件参数与命令行 --param 合并后再按既有规则绑定：同名时命令行值
+    # 覆盖文件值（含命令行空字符串覆盖非空文件值），与选项顺序无关
+    file_params = None
+    if args.params_file is not None:
+        try:
+            file_params = read_params_file(args.params_file[0])
+        except ValueError as exc:
+            die(str(exc))
+    args.params = merge_params(file_params, args.params)
     sql_text = args.sql
     if sql_text is None:
-        # 先读查询文件：文件类失败时不接触源库与输出目标
+        # 再读查询文件：文件类失败时不接触源库与输出目标
         try:
             sql_text = read_sql_file(args.sql_file)
         except ValueError as exc:
