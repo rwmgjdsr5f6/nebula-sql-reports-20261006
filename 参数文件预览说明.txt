@@ -1,0 +1,376 @@
+参数文件预览说明：--params-file 与 --param 合并后进入 --preview 的路径
+======================================================================
+
+- 编写日期：2026-10-08
+- 适用源码：当前目录下的 report.py、query.sql、test_params_file.py
+- 文档性质：
+  1. 本文全部行为结论按当前 report.py 源码静态推导，括注的“源码位置”
+     均指向当前 report.py 的行号；query.sql 与 test_params_file.py 的
+     引述分别指向各自文件的行号。
+  2. 凡写“现有测试断言”之处，指 test_params_file.py 中已经写出的断言
+     （给出测试方法名与行号区间），它们是核对依据而非实测记录；本文
+     未运行 python -m unittest，也未手工执行下面任何一条示例命令，
+     所有示例输出均为“按源码推导的静态预期”，不是实测结果。
+  3. 本次交付仅新增本文档；report.py、query.sql、全部测试、README.md
+     与既有《终端预览说明.txt》《参数查询导出说明.txt》《HTML查询说明
+     导出说明.txt》《源码核对说明.md》均保持原状，不做任何修改。
+- 文档定位：《参数查询导出说明.txt》覆盖 --param 到 CSV 产物的文件
+  导出路径，《终端预览说明.txt》覆盖不带参数文件的 --preview 路径；
+  本文专门补上二者的交叉部分——--params-file 读入并与命令行 --param
+  合并后进入 --preview 终端预览的这一条路径。同一份参数文件对 CSV
+  导出、HTML 导出的既有服务方式，以及 --tables/--describe 表结构查看
+  均保持原行为（见第八节）。
+
+
+一、样例库、query.sql 与 params.json
+--------------------------------------
+
+本文示例沿用 test_params_file.py 在临时目录中准备的 people/notes
+样例库（建表与插数见 test_params_file.py:246-267 的 _prepare_db），
+两表结构为：
+
+    people(id INTEGER PRIMARY KEY, name TEXT NOT NULL)
+    notes(person_id INTEGER PRIMARY KEY, note TEXT)
+
+数据（test_params_file.py:257-264）：
+
+    people: (1, '小明')、(2, '小红')
+    notes:  (1, NULL)、(2, '中文,含"引号"')   -- NOTE_VALUE 常量见
+                                               -- test_params_file.py:40
+
+notes.person_id 关联 people.id：编号 1 的小明备注是 SQL NULL，编号 2
+的小红备注是同时含中文、逗号与双引号的文本。
+
+注意：sample.sqlite 仓库不附带（.gitignore 忽略 *.sqlite），
+test_params_file.py 每个用例都在临时目录自行建库。下面的示例需按上述
+结构与数据自行准备 sample.sqlite，本文不涉及建库命令。
+
+查询沿用仓库现有的 query.sql，全文 4 行（query.sql:1-4），第 3 行含
+唯一的命名参数 :who：
+
+    SELECT p.name AS 姓名, n.note AS 备注
+    FROM people p JOIN notes n ON p.id = n.person_id
+    WHERE p.name = :who
+    ORDER BY p.id;
+
+参数文件 params.json 同样需自行准备（仓库不附带，本次交付也不创建
+该文件），内容恰为：
+
+    {"who":"小明"}
+
+read_params_file 对该文件的读回结果即 {"who": "小明"}（同构断言
+test_simple_object_returns_str_to_str_dict，
+test_params_file.py:71-73）。
+
+
+二、从命令行到预览输出的先后顺序
+----------------------------------
+
+命令行入口在到达 preview_csv 之前严格按下列顺序执行；任一步抛
+ValueError 即交 die（report.py:127-130）向标准错误写“错误: …”并以
+退出码 1 结束，其后步骤都不执行：
+
+ 顺序  步骤                                                源码位置
+ ----  --------------------------------------------------  ----------------
+  0    参数解析 parse_args：argparse 解析全部选项；       parse_args
+        --sql 与 --sql-file 必须恰好选一个                 report.py:1016-1150
+        （1110-1111）；--preview 须为正整数（1114-        互斥与行数
+        1115），与 --output、--format html、显式           report.py:1112-1123
+        --description、--title 互斥（1116-1123）；
+        --param 经 parse_param_options 在第一个等号
+        处拆名称/值，非法名称与同名重复在此拒绝
+        （调用 1141；定义 947-967）；--params-file 的
+        结构性规则——只能提供一次、路径不能为空——
+        在此判定（1145-1149），此时绝不读取参数文件
+  1    读取并校验参数文件：main 调 read_params_file       main 调用
+        （report.py:459-511）：二进制读入后按 utf-8-       report.py:1183-1188
+        sig 解码（允许开头恰一个 BOM，485）；JSON          read_params_file
+        解析时重复键拒绝（489-491）；顶层必须是一个        report.py:459-511
+        JSON 对象（494-498）；逐个键校验参数名
+        （502、309-316），值必须是 JSON 字符串
+        （505-509）。失败经 die 结束：这是 main 在
+        两个元数据模式分支之后做的第一件事，先于读
+        查询文件、打开源库与一切输出
+  2    合并：merge_params(file_params, args.params)       report.py:1189；
+        先放入文件全部条目，再以命令行 --param 整体         定义 514-525
+        update 覆盖；同名时命令行值生效（含空字符串），
+        与选项在命令行上的先后顺序无关；不修改传入
+        的两个字典
+  3    读取查询：--sql-file 时 read_sql_file 按 UTF-8     report.py:1190-1196；
+        读入（允许开头一个 BOM，定义 408-427）；--sql      read_sql_file
+        直接使用文本，两者适用相同规则                     report.py:408-427
+  4    预览分支调 preview_csv（定义 report.py:687-711）： main 调用
+        4a 行数正整数复核（703-704）                       report.py:1197-1207
+        4b _prepare_statement：null_text 必须是字符串
+           （556-559）；validate_params 复核合并后的
+           字典（560、319-337）；SQL 白名单——恰一条
+           SELECT（561、261-296）；bind_params 拒绝
+           位置占位符与缺少查询引用的参数、忽略未被
+           引用的合法参数（562、384-405）                  report.py:544-563
+        4c 以只读 URI 开库（缺失不建库），execute 后       report.py:706、
+           fetchall 取回全部结果，finally 关闭连接         579-619、528-541
+        4d 全部结果求值成功后才 rows[:limit] 切片，        report.py:709-710
+           经 csv.writer 把表头与数据行写标准输出
+           （656-658；SQL NULL 默认替换为空字段，
+           644-653）
+        4e 返回实际写出的数据行数                          report.py:711
+  5    main 预览分支 return 0，不打印任何成功提示         report.py:1207
+        （“已导出 N 行数据：…”只在文件导出分支末尾，      report.py:1234
+        预览路径不可达）
+
+要点：参数文件的读取与内容校验（顺序 1）排在读取查询文件（顺序 3）与
+打开源库（顺序 4c）之前；命令行覆盖发生在顺序 2，因此覆盖不能绕过
+顺序 1 的文件校验（反例见第六节）。
+
+
+三、两次预览的静态预期（按源码推导，非实测）
+----------------------------------------------
+
+准备：当前目录有按第一节备好的 sample.sqlite、仓库现有的 query.sql，
+以及内容为 {"who":"小明"} 的 params.json。
+
+第一次（仅文件参数）：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --params-file params.json --preview 1
+
+按源码推导：
+
+- 合并后参数为 {"who": "小明"}，WHERE p.name = '小明' 只命中 id=1；
+  该行备注是 SQL NULL，未给 --null-text 时按默认空字符串写成空字段
+  （report.py:710 经 _csv_records，report.py:644-653）；--preview 1
+  只展示一行数据。
+- 标准输出经 csv.reader 解析恰为：
+
+      [["姓名", "备注"], ["小明", ""]]
+
+  按 csv 默认 excel 方言，物理字节形如 “姓名,备注\r\n小明,\r\n”。
+- 退出码 0；标准错误为空；标准输出不追加“已导出”等成功提示；不创建
+  任何报告或临时文件（preview_csv 全程只写标准输出，
+  report.py:709-710；main 预览分支在成功提示之前 return，
+  report.py:1207）。
+- 现有测试断言：test_preview_with_params_file_shows_xiaoming_empty_note
+  （test_params_file.py:307-316）逐字断言退出码 0、标准错误为空、
+  CSV 解析结果为 [["姓名", "备注"], ["小明", ""]]。--sql 内联文本
+  配合参数文件的同构结果见
+  test_preview_with_inline_sql_also_accepts_params_file
+  （test_params_file.py:328-335）。
+
+第二次（追加命令行覆盖）：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --params-file params.json --param who=小红 --preview 1
+
+按源码推导：
+
+- merge_params 以命令行值覆盖文件值，合并结果为 {"who": "小红"}
+  （report.py:522-525），WHERE 只命中 id=2；小红的备注
+  '中文,含"引号"' 原样取回。
+- 标准输出经 csv.reader 解析恰为：
+
+      [["姓名", "备注"], ["小红", '中文,含"引号"']]
+
+  物理字节中该字段含逗号与双引号，由 csv.writer 按规则整体加引号并把
+  双引号双写，形如：'姓名,备注\r\n小红,"中文,含""引号"""\r\n'，
+  CSV 解析后完整还原为一个字段。
+- 退出码 0；标准错误为空；同样不追加成功提示、不创建任何报告或临时
+  文件。
+- 现有测试断言：test_preview_file_value_then_cli_overrides_to_xiaohong
+  （test_params_file.py:318-326）断言退出码 0 且 CSV 解析结果恰为
+  表头加 ["小红", NOTE_VALUE]。
+
+
+四、覆盖与选项顺序无关；空字符串也能覆盖
+------------------------------------------
+
+交换 --params-file 与 --param 在命令行上的先后顺序，不改变覆盖结果：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --param who=小红 --params-file params.json --preview 1
+
+其输出与第三节第二次完全相同：CSV 解析第二行为
+["小红", '中文,含"引号"']，退出码 0、标准错误为空。原因是合并只按
+“文件条目先入、命令行整体 update”进行，与 argv 中的选项次序无关
+（merge_params，report.py:514-525）。现有测试断言：
+test_cli_overrides_file_regardless_of_option_order
+（test_params_file.py:421-433）以两种顺序各跑一次并断言第二行相同；
+函数级断言 test_cli_value_overrides_file_value
+（test_params_file.py:200-203）确认覆盖结果，
+test_inputs_are_not_mutated（test_params_file.py:209-214）确认合并不
+修改两个入参字典。
+
+追加 --param who= 时，等号后的空字符串是有效文本值，同样覆盖文件中
+的非空值：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --params-file params.json --param who= --preview 1
+
+合并结果为 {"who": ""}（合并语义 report.py:522-525；空字符串在
+parse_param_options 中即为 partition 后的空值，report.py:957-966），
+WHERE p.name = '' 不匹配任何姓名，fetchall 取回零行；预览始终保留
+表头，故标准输出经 CSV 解析恰为：
+
+    [["姓名", "备注"]]
+
+退出码 0、标准错误为空、不创建任何文件。现有测试断言：
+test_cli_empty_string_overrides_nonempty_file_value
+（test_params_file.py:435-442；该用例文件值取 “小红”、--preview 5，
+与本例文件值 “小明” 不同，但合并与零行只留表头的结论同构）；函数级
+断言见 MergeParamsTestCase.test_cli_empty_string_overrides_nonempty_
+file_value（test_params_file.py:205-207）。
+
+
+五、参数文件的读取与校验规则
+------------------------------
+
+read_params_file（report.py:459-511）的规则：
+
+1. 按 UTF-8 读取，允许开头恰一个 BOM：先以二进制读入，再
+   data.decode("utf-8-sig")，仅剥除开头的一个 BOM，其余字节按 UTF-8
+   严格解码，非法 UTF-8 拒绝（report.py:475-487）。现有测试断言：
+   test_leading_bom_is_accepted（test_params_file.py:75-77）、
+   test_invalid_utf8_rejected（test_params_file.py:159-162）。
+2. 内容必须恰为一个 JSON 对象：数组、数字、布尔、null、JSON 字符串
+   等顶层形态一律拒绝（report.py:494-498）；JSON 语法错误拒绝
+   （492-493）；对象中的重复键在解析阶段即拒绝（489-491）。现有测试
+   断言：test_non_object_toplevel_rejected
+   （test_params_file.py:101-107）、test_invalid_json_syntax_rejected
+   （test_params_file.py:148-151）、test_duplicate_keys_rejected
+   （test_params_file.py:135-138）。
+3. 值只接受 JSON 字符串：数字、布尔值、null、数组与嵌套对象一律拒绝
+   （report.py:505-509，类型中文说明 _json_value_kind，
+   report.py:444-456）；空字符串是合法值（test_empty_string_value_
+   is_valid，test_params_file.py:83-85），一个非法条目不因同文件另有
+   合法条目而放行（test_one_illegal_value_rejects_whole_file_even_
+   with_legal_entry，test_params_file.py:120-123）。现有测试断言：
+   test_non_string_values_rejected（test_params_file.py:111-118）。
+4. 不推断类型：字符串解码后原样保留，“123”“null”“true” 不会被转成
+   数字或 NULL；中文、首尾空格、换行、等号、引号和分号原样保留
+   （read_params_file 文档串 report.py:462-470；合并后的值仍只经
+   cursor.execute 的绑定机制传参，report.py:606-609，绝不拼入 SQL）。
+   现有测试断言：test_decoded_string_text_is_preserved
+   （test_params_file.py:87-91）。
+5. 参数名区分大小写：键名遵循与 --param 相同的规则——首字符为 ASCII
+   字母或下划线，后续仅含 ASCII 字母、数字、下划线
+   （validate_param_name，report.py:309-316）；“Who” 与 “who” 是
+   两个不同的键，绑定时按字典精确成员判定（bind_params，
+   report.py:398-405）。现有测试断言：
+   test_key_names_follow_existing_param_rules_and_case
+   （test_params_file.py:93-97）、test_invalid_keys_rejected
+   （test_params_file.py:127-133）；端到端的大小写不匹配见
+   test_file_param_names_are_case_sensitive
+   （test_params_file.py:497-503，文件给 {"Who":"小红"} 时按
+   “缺少查询引用的参数：who” 失败）。
+6. 文件只被读取、绝不改写：现有测试断言预览成功后参数文件字节不变
+   test_params_file_bytes_unchanged_after_preview
+   （test_params_file.py:337-344）。
+
+
+六、反例：文件值非法时命令行覆盖不能绕过
+------------------------------------------
+
+把参数文件换成内容为 {"who":1} 的 bad.json（值为 JSON 数字），即使
+命令行同时给出同名的合法覆盖：
+
+    python report.py --db sample.sqlite --sql-file query.sql \
+        --params-file bad.json --param who=小红 --preview 5
+
+按源码推导：
+
+- 顺序 1 中 read_params_file 遍历到 who 的值是 int，抛 ValueError：
+  “参数文件 … 中参数 'who' 的值必须是 JSON 字符串，收到 数字”
+  （report.py:505-509）。
+- 顺序 2 的合并不再执行：main 在 read_params_file 抛出后立即 die
+  （report.py:1185-1188），命令行 --param 无从“顶替”文件中的非法
+  条目。
+- 命令行结果：退出码 1；标准输出为空；标准错误以“错误: ”开头
+  （die，report.py:127-130），并指出该值不是字符串（消息含
+  “JSON 字符串”）。
+- 现有测试断言：test_illegal_file_entry_cannot_be_bypassed_by_cli_
+  override（test_params_file.py:444-452）断言退出码 1、标准输出为空、
+  标准错误含“错误”与“字符串”。
+
+查询文件与源库也都不存在时，仍先报参数文件错误：
+
+    python report.py --db missing.sqlite --sql-file missing.sql \
+        --params-file bad.json --param who=小红 --preview 5
+
+参数文件读取（main 的顺序 1，report.py:1183-1188）先于查询文件读取
+（顺序 3，report.py:1190-1196）与只读开库（顺序 4c，
+report.py:706），故标准错误仍是参数文件的“值必须是 JSON 字符串”，
+而不是查询文件或源库缺失；不会创建 missing.sqlite，也不产生任何其他
+文件。现有测试断言（文件导出形态，校验顺序与预览相同）：
+test_params_file_validated_before_sql_file_and_db
+（test_params_file.py:597-611）——该用例的查询文件与源库均不存在并
+附带 --output out.csv，断言先报“字符串”，且 missing.sqlite 与
+out.csv 均不出现。
+
+另有两类失败发生在更早的参数解析阶段（顺序 0），同样不读取参数文件、
+标准输出为空、退出码 1：
+
+- --params-file 重复提供或路径为空：现有测试断言
+  test_repeated_params_file_rejected_without_reading
+  （test_params_file.py:507-515）、
+  test_empty_params_file_path_rejected_without_reading
+  （test_params_file.py:517-522）；源码 report.py:1145-1149。
+- 与 --tables、--describe 混用：即使参数文件路径本身不存在，也先报
+  混用而不报“参数文件不存在”，证明该判定不读取文件。现有测试断言：
+  test_params_file_mixed_with_tables_rejected_before_reading
+  （test_params_file.py:524-531）、
+  test_params_file_mixed_with_describe_rejected_before_reading
+  （test_params_file.py:533-540）。
+
+参数文件本身缺失或路径是目录的失败形态见
+test_missing_params_file_exit_one_empty_stdout_no_output
+（test_params_file.py:573-584）与
+test_directory_params_file_exit_one_empty_stdout_no_output
+（test_params_file.py:586-593）：退出码 1、标准输出为空、不创建文件。
+
+
+七、合并后仍按既有参数规则绑定
+--------------------------------
+
+合并后的字典在 preview_csv 的 _prepare_statement 中接受与直接 --param
+完全相同的既有校验（report.py:560-562）：
+
+- 查询引用而合并结果未提供的参数拒绝（如文件为 {} 时 :who 缺失）：
+  test_empty_object_with_referenced_param_is_missing_error
+  （test_params_file.py:466-473）。
+- 未被查询引用的合法文件参数忽略：
+  test_unreferenced_legal_file_param_is_ignored
+  （test_params_file.py:475-484）。
+- 位置占位符 ? 或 ?N 拒绝：
+  test_positional_placeholder_rejected_with_file_params
+  （test_params_file.py:486-495）。
+- 同名命令行 --param 重复仍在参数解析阶段拒绝，与是否存在参数文件
+  无关：test_duplicate_cli_param_still_rejected_with_params_file
+  （test_params_file.py:454-462）。
+- 不带 --params-file 的既有预览行为保持不变：
+  test_without_params_file_preview_unchanged_with_cli_param
+  （test_params_file.py:630-636）。
+
+
+八、范围：导出与表结构查看保持原行为；预览不留文件
+-----------------------------------------------------
+
+1. CSV/HTML 导出：--params-file 同样服务于文件导出，合并规则一致，
+   本文不改变其任何行为，已有的成功提示、独占新建写文件与 HTML 转义
+   规则照旧。现有测试断言：
+   test_csv_export_with_params_file_matches_direct_param
+   （test_params_file.py:348-366，文件参数与直接 --param 的 CSV 产物
+   逐字节一致）、test_csv_export_merged_params_match_equivalent_param_
+   set（test_params_file.py:368-388）、
+   test_html_export_escapes_file_and_cli_values
+   （test_params_file.py:392-417）。
+2. --tables 与 --describe 表结构查看：与参数文件互不相干，混用在参数
+   解析阶段即拒绝（见第六节），两条只读元数据路径的标准输出、退出码
+   与“不创建文件”约定均保持原状。
+3. 预览不留文件、三类输入保持不变：preview_csv 全程只写标准输出
+   （report.py:709-710）。test_params_file.py 每个端到端用例在
+   tearDown 中重新以只读方式打开源库，核对表结构与 people、notes
+   全部数据相对基线不变、查询文件字节不变
+   （test_params_file.py:239-244）；并有用例断言预览成功后目录不新增
+   报告或临时文件：
+   test_params_file_does_not_change_source_db_or_create_temp_files
+   （test_params_file.py:638-650）。即样例库的结构与数据、query.sql
+   以及参数文件在整条预览路径中均保持不变。
