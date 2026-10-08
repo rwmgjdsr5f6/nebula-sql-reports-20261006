@@ -1,0 +1,467 @@
+单表结构查看说明：--describe 与 describe_table 的现有行为
+==========================================================
+
+- 编写日期：2026-10-08
+- 适用源码：当前目录下的 report.py、test_describe.py
+- 文档性质：
+  1. 本文全部行为结论按当前 report.py 源码静态推导，括注的“源码位置”
+     均指向当前 report.py 的行号；test_describe.py 的引述指向该文件
+     的行号。
+  2. 凡写“现有测试断言”之处，指 test_describe.py（及个别处引用的
+     test_metadata_mode_validation.py）中已经写出的断言，给出测试
+     方法名与行号区间；它们是核对依据而非实测记录。本文未运行
+     python -m unittest，也未手工执行下面任何一条示例命令；所有
+     示例结果一律标为“按源码推导的静态预期”，不是实测结果。
+  3. 本次交付仅新增本文档；report.py、全部测试、README.md 与既有
+     《参数查询导出说明.txt》《HTML查询说明导出说明.txt》
+     《参数文件预览说明.txt》《终端预览说明.txt》《源码核对说明.md》
+     均保持原状，不做任何修改。
+- 文档定位：本文专门串讲 --describe / describe_table 单表结构查看
+  模式：命令行解析、表名精确匹配、元数据读取、连接关闭、CSV 输出与
+  错误转换，并说明该模式“只需数据库路径和表名”的规则，以及函数返回
+  列数与命令行退出码的区别。
+
+
+一、样例库结构（sample.sqlite 需按此准备，仓库不附带）
+------------------------------------------------------
+
+本文固定样例完整沿用 test_describe.py 在临时目录中准备的合成库
+（建库代码见 test_describe.py:82-108 的 _prepare_db）。仓库本身不
+附带该数据库文件（.gitignore 第 6-8 行忽略 *.sqlite / *.sqlite3 /
+*.sqlite-*），test_describe.py 每个用例都在临时目录自行建库。要手工
+核对本文示例，需先按下面的结构与数据准备 sample.sqlite。
+
+表名同时包含中文、空格与逗号："Ledger 账,单"
+（常量 TABLE_NAME，test_describe.py:29）。建表语句与
+test_describe.py:87-93 逐字一致：
+
+    CREATE TABLE "Ledger 账,单" (
+        "编号"   INTEGER PRIMARY KEY AUTOINCREMENT,
+        "备""注" TEXT DEFAULT '待填',
+        "数量",
+        "状态"   TEXT NOT NULL DEFAULT NULL
+    )
+
+四个声明列分别承担一种待核对形态：
+
+  cid  列名（保存值）  声明                                       关注点
+  ---  -------------  -----------------------------------------  ----------------
+   0    编号           INTEGER PRIMARY KEY AUTOINCREMENT          notnull=0、pk=1
+   1    备"注          TEXT DEFAULT '待填'                        引号列名、默认
+                                                                 表达式原文
+   2    数量           （未声明类型，也无默认值）                 两个空字段
+   3    状态           TEXT NOT NULL DEFAULT NULL                 notnull=1、
+                                                                 显式 NULL
+
+库中另有一个视图（test_describe.py:96-99），用于验证视图名被拒绝：
+
+    CREATE VIEW "账目视图" AS
+        SELECT "编号", "状态" FROM "Ledger 账,单"
+
+"编号"列的 AUTOINCREMENT 还会使 SQLite 自动生成 sqlite_sequence 表
+（它在 sqlite_master 中同样登记为 type='table'），用于验证内部表
+被拒绝（常量 VIEW_NAME / INTERNAL_NAME 见 test_describe.py:30、33）。
+
+样例数据只有一条记录（test_describe.py:101-105；常量见第 36-38 行）：
+
+    INSERT INTO "Ledger 账,单" ("备""注", "数量", "状态")
+    VALUES ('首条记录，含中文与"引号"', 7, '在册');
+
+插入后自增主键 "编号" 取值 1，sqlite_sequence 登记 (Ledger 账,单, 1)。
+这条记录仅用于证明“数据不进入结构输出”（见第五节末），--describe
+的输出中不会出现它的任何字段值。
+
+如需手工准备 sample.sqlite，可用与 test_describe.py:82-108 等价的
+一小段 Python（仅为备库用途，不是产品代码的一部分）：
+
+    import sqlite3
+    conn = sqlite3.connect("sample.sqlite")
+    conn.execute(
+        'CREATE TABLE "Ledger 账,单" ('
+        '"编号" INTEGER PRIMARY KEY AUTOINCREMENT, '
+        '"备""注" TEXT DEFAULT \'待填\', '
+        '"数量", '
+        '"状态" TEXT NOT NULL DEFAULT NULL)'
+    )
+    conn.execute('CREATE VIEW "账目视图" AS '
+                 'SELECT "编号", "状态" FROM "Ledger 账,单"')
+    conn.execute(
+        'INSERT INTO "Ledger 账,单" ("备""注", "数量", "状态") '
+        'VALUES (?, ?, ?)',
+        ('首条记录，含中文与"引号"', 7, '在册'),
+    )
+    conn.commit()
+    conn.close()
+
+
+二、两个入口：只需数据库路径与表名
+------------------------------------
+
+单表结构查看有两个等价入口，共用同一条读取路径：
+
+- 命令行入口：
+
+      python report.py --db sample.sqlite --describe "Ledger 账,单"
+
+  --db 必填（参数定义 report.py:1020），--describe 取恰好一个表名
+  参数（report.py:1021-1027）。该模式是独立模式：除帮助外仅接受
+  --db 与 --describe，不需要 --sql/--sql-file，不需要 --output，
+  也不与 --preview、--format、--param、--params-file、--null-text、
+  --description、--title 中任何一个同用（模块说明 report.py:14-26；
+  混用清册 _METADATA_CONFLICT_OPTIONS，report.py:974-986；混用校验
+  report.py:1096-1102）。
+
+- 函数入口：
+
+      report.describe_table(db_path, table_name)
+
+  定义见 report.py:826-886，签名只有“数据库路径 + 表名”两个位置
+  参数；CSV 直接写到标准输出，返回值是写出的声明列数据行数（不含
+  表头）。
+
+对应关系：main 在确认 args.describe 非 None 后
+（report.py:1167），以 args.db、args.describe 调用 describe_table
+（report.py:1171），不使用其返回值，成功后 return 0
+（report.py:1178），不打印“已导出”之类的成功提示（该提示只存在于
+查询导出分支 report.py:1234）。两个入口的差别仅在于：命令行先经过
+parse_args 的解析与互斥校验，且失败时 main 把 ValueError 转成
+标准错误消息加退出码 1（die，report.py:127-130；捕获见
+report.py:1170-1177）。
+
+
+三、主流程串讲：解析 → 表名匹配 → 元数据读取 → 关闭连接 → CSV 输出
+--------------------------------------------------------------------
+
+以函数入口 describe_table（report.py:826-886）为主线，命令行入口
+在此之前先完成 parse_args。任一步抛 ValueError，其后步骤都不执行：
+
+  顺序  步骤                                                源码位置
+  ----  --------------------------------------------------  -------------
+   0    （仅命令行）解析参数：--db 必填；--describe NAME     argparse 定义
+        取值；--describe 分支先做混用校验（先于空表名       report.py:
+        校验），再拒绝恰好为空字符串的表名，然后返回        1020-1027；
+                                                           分支
+                                                           report.py:
+                                                           1096-1102
+   1    入参类型：table_name 必须是字符串，否则抛            report.py:
+        ValueError（describe 表名必须是字符串……）          847-850
+   2    只读开库：file:...?mode=ro URI 打开，并立即查       report.py:851
+        sqlite_master 强制解析文件头；库缺失不会创建        →528-541
+        （open_readonly）；sqlite3.Error 统一转为
+        ValueError（无法以只读方式打开数据库……）
+   3    表名匹配：在 sqlite_master 中按 name = ? 绑定       report.py:
+        参数查找并显式 COLLATE BINARY，且要求               855-859
+        type='table'；表名绝不拼入 SQL 文本
+   4    拒绝判定：查无此行，或表名以 sqlite_ 开头，抛        report.py:
+        ValueError（未找到可查看的用户表：<原名>）。        860-861
+        视图虽能被 PRAGMA 返回列信息，但在第 3 步即因
+        type='view' 落选；sqlite_sequence 虽登记为
+        table，但由前缀判定排除
+   5    元数据读取：表值 PRAGMA pragma_table_info(?,         report.py:
+        "main") 取六字段，ORDER BY cid 升序；读取阶段      863-867
+        的 sqlite3.Error 转为 ValueError（元数据读取
+        失败：……，第 868-869 行）
+   6    关闭连接：try/finally 中 conn.close()，匹配失败     report.py:
+        与元数据读取失败同样执行；开库阶段失败的连接由      870-871；
+        open_readonly 自行关闭                              538-539
+   7    组装逻辑记录：首行固定六字段表头                     report.py:
+        DESCRIBE_HEADER，其后逐列把空类型转空字段、         822-823、
+        None 默认值转空字段，其余原样保留                   873-880
+   8    CSV 输出：全部元数据取回、连接关闭之后才用标准       report.py:
+        csv 方言写 sys.stdout；失败路径上标准输出尚无       882-885
+        任何字节，不会留下半截 CSV
+   9    返回：return len(columns)，即声明列数据行数         report.py:886
+        （不含表头）
+  10    （仅命令行）main 捕获 ValueError 经 die 写标准       report.py:
+        错误（“错误: ”前缀）并退出 1；残留的                1170-1177；
+        sqlite3.Error / OSError 同样转为失败；成功          die 127-130
+        return 0，经 sys.exit(main()) 成为进程退出码        report.py:
+                                                           1178、
+                                                           1238-1239
+
+
+四、成功路径固定样例（按源码推导的静态预期，非实测）
+----------------------------------------------------
+
+准备：按第一节备好 sample.sqlite。
+
+命令行（注意表名含空格与逗号， shell 中要整体加引号）：
+
+    python report.py --db sample.sqlite --describe "Ledger 账,单"
+
+等价函数调用（CSV 直接写入当前标准输出）：
+
+    import report
+    n = report.describe_table("sample.sqlite", "Ledger 账,单")
+    # n == 4
+
+标准输出的 CSV 文本按标准 csv 方言呈现为（下块按逻辑行展示；标准
+csv.writer 默认行终止符是 \r\n，经通用换行读取或 CSV 解析后即为下面
+的各行。唯一需要 CSV 加引号的是含双引号的列名 “备"注”，写作
+"备""注"）：
+
+    cid,name,type,notnull,dflt_value,pk
+    0,编号,INTEGER,0,,1
+    1,"备""注",TEXT,0,'待填',0
+    2,数量,,0,,0
+    3,状态,TEXT,1,NULL,0
+
+核对基准是“CSV 解析后的逻辑记录”，与 test_describe.py:41-47 的
+EXPECTED_RECORDS 完全一致，共 5 条逻辑记录（1 条表头 + 4 条列记录）：
+
+    [
+      ["cid", "name", "type", "notnull", "dflt_value", "pk"],
+      ["0", "编号",  "INTEGER", "0", "",      "1"],
+      ["1", "备\"注", "TEXT",    "0", "'待填'", "0"],
+      ["2", "数量",  "",        "0", "",      "0"],
+      ["3", "状态",  "TEXT",    "1", "NULL",  "0"],
+    ]
+
+其余静态预期：
+
+- 结果每行有 6 个字段；4 条列记录对应 4 个声明列。函数返回值 4 是
+  列记录数（不含表头，report.py:886），不是字段个数。
+- 命令行退出码 0（main 的 describe 分支 return 0，report.py:1178），
+  标准错误为空，标准输出不追加任何成功提示（该分支没有 print；
+  “已导出 …”提示仅在 report.py:1234 的导出分支）。
+- 函数入口与命令行入口写出的 CSV 逻辑记录一致。
+- 现有测试断言：函数用例 test_function_describe_returns_four_with_
+  full_metadata（test_describe.py:173-183）断言返回 4、解析结果等于
+  EXPECTED_RECORDS、cid 依次为 0/1/2/3、列名 '备"注' 完整还原；
+  命令行用例 test_cli_describe_exit_zero_csv_only
+  （test_describe.py:219-232）断言退出码 0、标准错误为空、输出中不含
+  “已导出”、解析结果与函数入口一致且共 5 条记录。
+
+
+五、六字段语义逐项核对
+----------------------
+
+字段名与取值全部来自表值 PRAGMA pragma_table_info
+（report.py:863-867），代码只做空值规整，不做任何重命名或改写
+（report.py:873-880）：
+
+1. cid（列序号）
+
+   - 按 ORDER BY cid 升序（report.py:865），即建表声明顺序；本例
+     依次为 0、1、2、3，cid 从 0 开始（模块说明 report.py:18-19）。
+   - 字段顺序与列序号属于现有公开语义：--describe 不重排、不筛选
+     声明列。
+
+2. name（列名保存值）
+
+   - 建表时 "备""注" 是双引号内双写转义，保存名称为一个字符：备"注。
+     输出时该字段因含双引号被 CSV 写作 "备""注"，CSV 解析后完整还原
+     为 备"注（断言 test_describe.py:183）。中文、空格、逗号、引号
+     统一走标准 csv.writer（report.py:884-885），与查询导出同一规则。
+
+3. type（声明类型）
+
+   - 有声明则原文给出：INTEGER、TEXT。
+   - "数量" 建表时未声明类型，SQLite 返回空串，代码以 ctype or ""
+     输出为空字段（report.py:877-879），不填占位词。
+   - 断言：rows["数量"][2] == ""（test_describe.py:199）。
+
+4. notnull（0/1）
+
+   - 保留 SQLite 返回的整数，不因主键身份自行改写
+     （report.py:839、模块说明 report.py:19-20）。
+   - "编号" 虽是 INTEGER PRIMARY KEY，notnull 仍为 0；只有显式
+     NOT NULL 的 "状态" 为 1，其余三列均为 0。
+   - 断言见 test_describe.py:189-197。
+
+5. dflt_value（默认值）
+
+   - 无默认值时 SQLite 给 Python None，代码输出空字段
+     （report.py:879：dflt if dflt is not None else ""）："编号"、
+     "数量" 均为空字段。
+   - "备\"注 的 DEFAULT '待填' 是默认表达式，元数据保留原文
+     '待填'（含一对单引号），不做求值、不剥引号（report.py:841-842）。
+   - "状态" 的显式 DEFAULT NULL 在元数据中是文本字符串 "NULL"，
+     它不是 Python None，因此原样输出四个字符 NULL，与“无默认值”的
+     空字段明确区分（report.py:840-842、875-879）。
+   - 断言见 test_describe.py:201-204。
+
+6. pk（主键位置序号）
+
+   - 保留 SQLite 返回的整数："编号" 为 1（主键中的列序号，非零即
+     属主键），其余三列为 0；代码不因为 NOT NULL 或 UNIQUE 改写
+     （report.py:839）。
+   - 断言见 test_describe.py:189-193。
+
+表内样例记录不进入结构输出：输出只有表头加四条列记录，共 5 条；
+'首条记录，含中文与"引号"'、7、'在册' 都不会出现在任何字段中
+（test_function_describe_output_has_structure_only，
+test_describe.py:206-215）。本模式只读元数据，不读取表内数据行。
+
+
+六、表名匹配规则与拒绝边界
+--------------------------
+
+匹配规则（report.py:855-861）：
+
+- 表名以绑定参数 ? 提供，绝不拼入 SQL，中文、空格、引号按完整文本
+  查找。
+- 显式 COLLATE BINARY：区分大小写（SQLite 标识符默认比较对 ASCII
+  大小写不敏感，这里刻意改回精确比较），"Notes" 与 "notes" 不等；
+  空白与中文按字符原值比较（注释 report.py:853-854）。
+- 全程不去除首尾空白：describe_table 与参数解析都没有 strip 调用；
+  parse_args 只拒绝“恰好为空字符串”的 --describe ""
+  （report.py:1100-1101），"   " 这类名字会原样进入查表。另一组
+  现有测试断言：纯空格表名 " " 在库中存在时正常输出；不存在的
+  "   " 报“未找到”且错误中保留三个空格，而不是参数错误
+  （test_metadata_mode_validation.py:200-214）。
+- 可查看对象必须同时满足 sqlite_master 中 type='table' 且名称不以
+  sqlite_ 开头：不存在的名字、视图、内部表统一拒绝，错误消息固定为
+  “未找到可查看的用户表：<被拒绝的原名>”（report.py:860-861）。
+
+仅改变大小写的失败示例（重点样例）：库中保存名是 "Ledger 账,单"，
+把首字母改成小写得到 "ledger 账,单"（常量 CASE_VARIANT_NAME，
+test_describe.py:31），其余字符（含空格、中文、逗号）完全不变。
+
+- 函数入口：
+
+      report.describe_table("sample.sqlite", "ledger 账,单")
+
+  按源码推导的静态预期：抛 ValueError，消息为
+  “未找到可查看的用户表：ledger 账,单”（含原因与被拒绝的名字）；
+  抛错发生在任何标准输出写入之前，标准输出为空。
+
+- 命令行入口：
+
+      python report.py --db sample.sqlite --describe "ledger 账,单"
+
+  静态预期：退出码 1；标准输出为空；标准错误为一行
+  “错误: 未找到可查看的用户表：ledger 账,单”，即以“错误: ”开头
+  （die，report.py:127-130），并包含原因短语“未找到可查看的用户表”。
+
+同类拒绝还有三种，函数/命令行的外观约定与上例完全相同
+（REJECTED_NAMES 清册 test_describe.py:54-59）：
+
+  情形                --describe 参数        拒绝依据
+  ------------------  --------------------  --------------------------
+  不存在的表          不存在的表 名称       sqlite_master 查无此行
+  视图名              账目视图              type='view'，第 3 步落选
+  内部表              sqlite_sequence       startswith("sqlite_")
+                      （AUTOINCREMENT 自动   （report.py:860）
+                       生成，且登记为 table）
+
+函数入口对四类名字一律抛 ValueError 且标准输出为空，断言异常消息
+同时含原因与具体名字（test_function_rejected_names_raises_
+valueerror_empty_stdout，test_describe.py:236-247）；命令行入口一律
+退出码 1、标准输出为空、标准错误含“错误:”前缀、原因短语与被拒绝
+名字（test_cli_rejected_names_exit_one_stderr_reason_empty_stdout，
+test_describe.py:251-262）。
+
+
+七、源库缺失或损坏
+------------------
+
+- 路径不存在：open_readonly 用绝对路径的 file: URI 加 ?mode=ro 打开
+  （report.py:530-533），只读模式绝不会创建新库；连接惰性建立，故
+  紧接一条 SELECT count(*) FROM sqlite_master 强制解析文件头与首页
+  （report.py:534-536），文件不存在在此暴露，sqlite3.Error 被转为
+  ValueError“无法以只读方式打开数据库 <路径>：<SQLite 原因>”
+  （report.py:537-540）。
+- 文件损坏（存在但不是有效 SQLite 数据库）：同样在第 536 行的强制
+  读取处暴露，走同一条转换路径，原因短语同为“无法以只读方式打开
+  数据库”。
+
+按源码推导的静态预期：
+
+- 函数入口 describe_table("missing.sqlite", "Ledger 账,单") 抛
+  ValueError，消息含“无法以只读方式打开数据库”，标准输出为空；
+  missing.sqlite 始终不会被创建。
+- 命令行入口 python report.py --db missing.sqlite --describe
+  "Ledger 账,单" 退出码 1，标准输出为空，标准错误以“错误: ”开头
+  并含“无法以只读方式打开数据库”。
+- 现有测试断言（路径不存在形态）：
+  test_function_missing_db_raises_and_creates_nothing
+  （test_describe.py:266-277）与 test_cli_missing_db_exit_one_and_
+  creates_nothing（test_describe.py:279-290）分别断言上述函数与
+  命令行行为，并断言调用前后缺失路径都不存在。
+
+
+八、--describe 与 --sql-file 混用：参数阶段即拒绝
+--------------------------------------------------
+
+示例：
+
+    python report.py --db sample.sqlite --describe "Ledger 账,单" \
+        --sql-file query.sql
+
+按源码推导的静态预期：退出码 1，标准输出为空；标准错误先输出一行
+usage 用法（_Parser.error 先 print_usage，report.py:942-944），其后
+一行以“错误: 参数错误：”开头，完整说明选项不能同用：
+
+    错误: 参数错误：--describe 仅与 --db 搭配，不能与其他选项同用：--sql-file
+
+源码依据：
+
+- parse_args 的 --describe 分支最先调用混用校验
+  （report.py:1099 的 _reject_metadata_extras；实现见
+  report.py:1006-1013），--sql-file 在固定冲突清册中排第二
+  （_METADATA_CONFLICT_OPTIONS，report.py:974-986）。parser.error
+  经 die 结束进程，退出码 1（report.py:942-944、127-130）。
+- 拒绝发生在 parse_args 内（report.py:1096-1102），main 的
+  describe 分支（report.py:1167-1178）根本不会执行；查询文件的读取
+  位于查询模式分支（report.py:1191-1196），此处不可达；数据库也不会
+  打开。即：不读取查询文件、不打开数据库、不创建任何文件。
+- 现有测试断言：逐个冲突选项的拒绝中，--sql-file 用例刻意指向不
+  存在的文件路径，仍在参数阶段失败（test_metadata_mode_validation.py
+  第 242、249 行的用例构造；test_describe_rejects_each_conflicting_
+  option，同文件 291-296 行；断言退出 1、标准输出为空、标准错误含
+  usage 行与“错误: 参数错误”）。同形态的 --describe 与 --output
+  混用还额外断言所指输出文件不会被创建（test_cli_describe_with_
+  output_rejected_no_file，test_describe.py:294-308）。
+
+
+九、返回值与退出码的区别、连接释放与无副作用
+--------------------------------------------
+
+函数返回列数 vs 命令行退出码：
+
+- describe_table 成功时返回声明列数（不含表头）：本例 4
+  （report.py:886）。它是给调用方程序使用的整数，与 CSV 文本一起
+  构成函数结果。
+- 命令行不暴露这个 4：main 调用时不接收返回值（report.py:1171），
+  无条件 return 0（report.py:1178），经 sys.exit(main())
+  （report.py:1238-1239）成为进程退出码。因此成功时 shell 看到的
+  退出码恒为 0。
+- 失败时函数没有返回值而是抛 ValueError（表名问题 report.py:849、
+  861、869；开库问题 report.py:540）；命令行由 main 捕获后经 die
+  统一变为退出码 1 与“错误: ”前缀的标准错误
+  （report.py:1170-1173），残留的 sqlite3.Error、OSError 也分别在
+  report.py:1174-1177 转为同样的失败外观。
+
+连接释放：
+
+- 成功、表名拒绝、元数据读取失败三种情况都在 finally 中
+  conn.close()（report.py:870-871）；开库阶段失败时连接由
+  open_readonly 的 except 分支关闭（report.py:538-539）。不存在
+  携带打开连接退出的路径。
+
+不新增文件、源库不变（成功与失败皆然）：
+
+- 全流程只以只读 URI 打开源库（report.py:530-533），只执行对
+  sqlite_master 的 SELECT 与 pragma_table_info 表值 PRAGMA
+  （report.py:855-859、863-867），没有任何写库语句；输出只写
+  sys.stdout（report.py:884-885），没有输出路径参数，也不产生临时
+  文件。库缺失时只读 URI 也不会创建文件（见第七节）。
+- 现有测试在每个用例的 tearDown 中重新以只读方式打开源库，对照
+  sqlite_master、pragma_table_info、表内全部数据、视图数据与
+  sqlite_sequence 的建库基线快照，并核对临时目录文件清单不变
+  （test_describe.py:74-80、110-150）——成功用例与拒绝用例同受此
+ 约束。
+
+
+十、覆盖范围
+------------
+
+- 本文与当前 --describe 实现的覆盖范围一致：普通声明列的六字段
+  元数据（模块说明 report.py:25-26 明确本轮不覆盖生成列、隐藏列、
+  索引或外键展示）。
+- 本模式只读取元数据，不读取表内数据；不提供行数、索引、外键等
+  其他信息。
+- 既有 CSV/HTML 导出、--param/--params-file 参数文件、--preview
+  终端预览以及 --tables 表名列举的行为全部保持原样；本次交付不修改
+  产品代码、测试与既有文档，仅新增本说明文件。
