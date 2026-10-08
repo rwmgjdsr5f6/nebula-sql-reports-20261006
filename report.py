@@ -967,6 +967,52 @@ def parse_param_options(items, parser):
     return params
 
 
+# --tables/--describe 两个只读元数据模式共用的混用选项清单：
+# (parse_args 属性名, 错误信息中的选项名)。次序固定，多项冲突时原因
+# 始终按此次序列出，不随命令行输入顺序变化；--describe 自身不在此列，
+# 仅 --tables 模式需要把它额外计入（并排在最前）
+_METADATA_CONFLICT_OPTIONS = (
+    ("sql", "--sql"),
+    ("sql_file", "--sql-file"),
+    ("output", "--output"),
+    ("preview", "--preview"),
+    ("format", "--format"),
+    ("param", "--param"),
+    ("params_file", "--params-file"),
+    ("null_text", "--null-text"),
+    ("description", "--description"),
+    ("title", "--title"),
+)
+
+
+def _metadata_mode_extras(args, include_describe=False):
+    """收集与元数据模式不能同用、且已显式提供的选项名（按固定次序返回）。
+
+    以 None 区分“未提供”（--param/--params-file 的默认空列表同理），
+    因此 --null-text、--description、--title 即使显式给空字符串也会被
+    计入，不能借空值放行；返回次序只取决于 _METADATA_CONFLICT_OPTIONS
+    的声明次序，与命令行输入顺序无关。
+    """
+    extras = []
+    if include_describe and args.describe is not None:
+        extras.append("--describe")
+    for attr, label in _METADATA_CONFLICT_OPTIONS:
+        value = getattr(args, attr)
+        if value is not None and value != []:
+            extras.append(label)
+    return extras
+
+
+def _reject_metadata_extras(parser, args, mode_option, include_describe=False):
+    """两个元数据模式共用的混用校验：存在任何冲突选项即按参数错误退出。"""
+    extras = _metadata_mode_extras(args, include_describe=include_describe)
+    if extras:
+        parser.error(
+            "%s 仅与 --db 搭配，不能与其他选项同用：%s"
+            % (mode_option, " ".join(extras))
+        )
+
+
 def parse_args(argv):
     parser = _Parser(
         description="对 SQLite 执行一条只读 SELECT 并导出带列名的 CSV 或 HTML 报告"
@@ -1039,68 +1085,18 @@ def parse_args(argv):
     )
     args = parser.parse_args(argv)
     if args.tables:
-        # 表名列举是独立模式：除帮助外仅接受 --db 与 --tables，
-        # 与 --describe 及其他任何现有选项（含显式 --format csv）同用均
-        # 按参数错误拒绝；此判定先于读文件与开库，混用时绝不接触它们
-        extras = []
-        if args.describe is not None:
-            extras.append("--describe")
-        if args.sql is not None:
-            extras.append("--sql")
-        if args.sql_file is not None:
-            extras.append("--sql-file")
-        if args.output is not None:
-            extras.append("--output")
-        if args.preview is not None:
-            extras.append("--preview")
-        if args.format is not None:
-            extras.append("--format")
-        if args.param:
-            extras.append("--param")
-        if args.params_file:
-            extras.append("--params-file")
-        if args.null_text is not None:
-            extras.append("--null-text")
-        if args.description is not None:
-            extras.append("--description")
-        if args.title is not None:
-            extras.append("--title")
-        if extras:
-            parser.error(
-                "--tables 仅与 --db 搭配，不能与其他选项同用：%s"
-                % " ".join(extras)
-            )
+        # 表名列举是独立模式：除帮助外仅接受 --db 与 --tables。
+        # --tables 与 --describe 并存时仍报告 --tables 的混用错误，
+        # 故此模式把 --describe 一并计入冲突；此判定先于读文件与开库，
+        # 混用时绝不接触它们
+        _reject_metadata_extras(
+            parser, args, "--tables", include_describe=True
+        )
         return args
     if args.describe is not None:
-        # 表结构查看是独立模式：除帮助外仅接受 --db 与 --describe，
-        # 与其他任何现有选项同用均按参数错误拒绝（此判定先于模式各自
-        # 的必填校验，缺参与混用并存时一律报混用）
-        extras = []
-        if args.sql is not None:
-            extras.append("--sql")
-        if args.sql_file is not None:
-            extras.append("--sql-file")
-        if args.output is not None:
-            extras.append("--output")
-        if args.preview is not None:
-            extras.append("--preview")
-        if args.format is not None:
-            extras.append("--format")
-        if args.param:
-            extras.append("--param")
-        if args.params_file:
-            extras.append("--params-file")
-        if args.null_text is not None:
-            extras.append("--null-text")
-        if args.description is not None:
-            extras.append("--description")
-        if args.title is not None:
-            extras.append("--title")
-        if extras:
-            parser.error(
-                "--describe 仅与 --db 搭配，不能与其他选项同用：%s"
-                % " ".join(extras)
-            )
+        # 表结构查看是独立模式：除帮助外仅接受 --db 与 --describe
+        # （此判定先于模式各自的必填校验，缺参与混用并存时一律报混用）
+        _reject_metadata_extras(parser, args, "--describe")
         if args.describe == "":
             parser.error("--describe 表名不能为空")
         return args
