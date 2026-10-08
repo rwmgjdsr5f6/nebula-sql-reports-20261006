@@ -967,6 +967,36 @@ def parse_param_options(items, parser):
     return params
 
 
+def _standalone_mode_conflicts(args, include_describe):
+    """汇集独立元数据模式（--tables/--describe）禁止同用的选项名列表。
+
+    两种模式原先各自维护一份相同的混用判定，现集中在此：除 --db 与模式
+    自身外，查询来源、输出、预览、格式、参数与 HTML 文案选项一律冲突。
+    是否"已提供"只看 None/空列表哨兵而不看具体值：显式 --format csv 与
+    空字符串值的 --null-text/--description/--title 同样算冲突。返回的
+    选项名按固定的声明顺序排列，与命令行上的输入顺序无关。
+    include_describe 为真时把 --describe 也列入判定（供 --tables 模式
+    使用；--describe 模式自身不需要这项，--tables 的判定在它之前）。
+    """
+    extras = []
+    if include_describe and args.describe is not None:
+        extras.append("--describe")
+    checks = (
+        ("--sql", args.sql is not None),
+        ("--sql-file", args.sql_file is not None),
+        ("--output", args.output is not None),
+        ("--preview", args.preview is not None),
+        ("--format", args.format is not None),
+        ("--param", bool(args.param)),
+        ("--params-file", bool(args.params_file)),
+        ("--null-text", args.null_text is not None),
+        ("--description", args.description is not None),
+        ("--title", args.title is not None),
+    )
+    extras.extend(name for name, provided in checks if provided)
+    return extras
+
+
 def parse_args(argv):
     parser = _Parser(
         description="对 SQLite 执行一条只读 SELECT 并导出带列名的 CSV 或 HTML 报告"
@@ -1042,29 +1072,7 @@ def parse_args(argv):
         # 表名列举是独立模式：除帮助外仅接受 --db 与 --tables，
         # 与 --describe 及其他任何现有选项（含显式 --format csv）同用均
         # 按参数错误拒绝；此判定先于读文件与开库，混用时绝不接触它们
-        extras = []
-        if args.describe is not None:
-            extras.append("--describe")
-        if args.sql is not None:
-            extras.append("--sql")
-        if args.sql_file is not None:
-            extras.append("--sql-file")
-        if args.output is not None:
-            extras.append("--output")
-        if args.preview is not None:
-            extras.append("--preview")
-        if args.format is not None:
-            extras.append("--format")
-        if args.param:
-            extras.append("--param")
-        if args.params_file:
-            extras.append("--params-file")
-        if args.null_text is not None:
-            extras.append("--null-text")
-        if args.description is not None:
-            extras.append("--description")
-        if args.title is not None:
-            extras.append("--title")
+        extras = _standalone_mode_conflicts(args, include_describe=True)
         if extras:
             parser.error(
                 "--tables 仅与 --db 搭配，不能与其他选项同用：%s"
@@ -1075,27 +1083,7 @@ def parse_args(argv):
         # 表结构查看是独立模式：除帮助外仅接受 --db 与 --describe，
         # 与其他任何现有选项同用均按参数错误拒绝（此判定先于模式各自
         # 的必填校验，缺参与混用并存时一律报混用）
-        extras = []
-        if args.sql is not None:
-            extras.append("--sql")
-        if args.sql_file is not None:
-            extras.append("--sql-file")
-        if args.output is not None:
-            extras.append("--output")
-        if args.preview is not None:
-            extras.append("--preview")
-        if args.format is not None:
-            extras.append("--format")
-        if args.param:
-            extras.append("--param")
-        if args.params_file:
-            extras.append("--params-file")
-        if args.null_text is not None:
-            extras.append("--null-text")
-        if args.description is not None:
-            extras.append("--description")
-        if args.title is not None:
-            extras.append("--title")
+        extras = _standalone_mode_conflicts(args, include_describe=False)
         if extras:
             parser.error(
                 "--describe 仅与 --db 搭配，不能与其他选项同用：%s"
