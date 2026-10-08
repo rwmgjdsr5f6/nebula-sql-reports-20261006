@@ -3,6 +3,7 @@
 
 用法:
     python report.py --db DB.sqlite --sql "SELECT ..." --output out.csv
+    python report.py --db DB.sqlite --sql "SELECT ..." --output out.csv --csv-bom
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv
     python report.py --db DB.sqlite --sql-file query.sql --output out.csv \
         --param who=小红 --param tag=a=b
@@ -84,6 +85,18 @@ CSV 导出、HTML 导出与终端预览：与 --sql 或 --sql-file 恰选一个�
 查询结果一致；零行结果仍保留表头。单元格文本中的 &、<、>、双引号与
 单引号按 HTML 转义为文字显示，不产生额外标签或脚本；中文、首尾空格与
 换行完整保留。页面不依赖任何外部资源，直接打开即可查看。
+
+--csv-bom 为不带值的开关，默认关闭，仅用于 CSV 文件导出：省略
+--format 或显式 --format csv 时均可使用。开启时在文件最前写入 UTF-8
+BOM（U+FEFF，字节 EF BB BF），位于首个列名之前，不增加字段、列名字符
+或记录；其后的字节与关闭时在相同输入下生成的 CSV 完全一致，列顺序、行
+顺序、空字符串、SQL NULL 的替换、中文、逗号、引号与换行均保持现有语义。
+用 UTF-8-sig 解码后，两种文件经 CSV 解析得到相同表头与数据；列名或数据
+本身含 U+FEFF 时该字符仍原样保留，不为避免重复标记而删改。零行查询仍
+输出 BOM 与表头并返回 0。不开启时输出与既往版本逐字节一致；输出格式仍
+只由 --format 决定，不由文件扩展名推断。该开关与 HTML、--preview、
+--tables 或 --describe 混用一律在读取任何输入文件前按参数错误拒绝，
+退出码 1、标准输出为空、标准错误以“错误: ”开头说明原因，不生成报告。
 
 --description TEXT 为 HTML 报告附加一段纯文本查询说明（如筛选口径），
 显示在主标题之后、结果表格之前的独立文本区域；说明不进入表头、数据行、
@@ -698,7 +711,8 @@ def _write_csv_records(fileobj, headers, rows, null_text):
     csv.writer(fileobj).writerows(_csv_records(headers, rows, null_text))
 
 
-def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
+def export_csv(db_path, sql_text, output_path, params=None, null_text="",
+               csv_bom=False):
     """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
 
     params 为可选的 名称->文本 参数字典（键不带占位符前缀），为查询中的
@@ -710,16 +724,35 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     （None、数字等）抛 ValueError 且不创建输出文件。空字符串是有效标记；
     标记不影响列名、列顺序、行顺序、非空值与数据行数，源数据中的空字符串
     仍写为空字段。
+
+    csv_bom 为可选的 UTF-8 BOM 开关，默认 False（与原行为逐字节一致）。
+    必须是真正的 bool 值（非 bool 的真值如 1、"true" 抛 ValueError），且
+    在打开源库或创建文件之前拒绝。为 True 时仅在文件最前写入 U+FEFF
+    （编码为字节 EF BB BF），位于首个列名之前：不增加字段、列名字符或
+    记录，其后内容与 False 时在相同输入下逐字节一致；列名或数据本身含
+    U+FEFF 时该字符仍原样保留，不做去重处理。零行查询仍写入 BOM 与表头，
+    返回 0。
     """
-    # 三个入口共用同一份查询准备：空值标记类型、参数字典、SQL 与占位符
+    # 开关类型是本入口的专属校验，最先拒绝（在打开源库或创建文件之前）；
+    # 之后三个入口共用同一份查询准备：空值标记类型、参数字典、SQL 与占位符
+    if not isinstance(csv_bom, bool):
+        raise ValueError(
+            "csv_bom 必须是布尔值，收到 %s" % type(csv_bom).__name__
+        )
     statement, bound = _prepare_statement(sql_text, params, null_text)
     # 输入校验通过后先预查输出目录与目标占用，再以只读方式打开源库
     _ensure_output_available(output_path)
     headers, rows = _run_readonly(db_path, statement, bound)
 
-    _write_output_file(
-        output_path, lambda f: _write_csv_records(f, headers, rows, null_text)
-    )
+    def _write(f):
+        # BOM 只作为文件起始的编码前缀写入一次，不进入任何字段或记录；
+        # 表头/数据仍完全交给共用的 CSV 写出规则
+        if csv_bom:
+            # 写入 U+FEFF（ZERO WIDTH NO-BREAK SPACE）：UTF-8 编码即 EF BB BF
+            f.write("\ufeff")
+        _write_csv_records(f, headers, rows, null_text)
+
+    _write_output_file(output_path, _write)
 
     return len(rows)
 
@@ -1025,6 +1058,7 @@ _METADATA_CONFLICT_OPTIONS = (
     ("description", "--description"),
     ("description_file", "--description-file"),
     ("title", "--title"),
+    ("csv_bom", "--csv-bom"),
 )
 
 
@@ -1094,6 +1128,14 @@ def parse_args(argv):
         help="输出格式：csv（默认）或 html；输出类型只由该选项决定",
     )
     parser.add_argument(
+        "--csv-bom",
+        dest="csv_bom",
+        action="store_true",
+        default=None,
+        help="在 CSV 文件开头写入 UTF-8 BOM（EF BB BF）；默认关闭，"
+        "仅用于 CSV 文件导出，不支持 HTML、预览、--tables 或 --describe",
+    )
+    parser.add_argument(
         "--param",
         action="append",
         metavar="name=value",
@@ -1157,6 +1199,10 @@ def parse_args(argv):
         args.format = "csv"
     if args.null_text is None:
         args.null_text = ""
+    # 与 --format/--null-text 同样：元数据模式提前返回，csv_bom 保持 None；
+    # 查询/导出/预览模式补成布尔默认值，main 可直接传给 export_csv
+    if args.csv_bom is None:
+        args.csv_bom = False
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
         parser.error("--sql 与 --sql-file 必须恰好选择一个")
@@ -1176,6 +1222,8 @@ def parse_args(argv):
             )
         if args.title is not None:
             parser.error("--preview 不支持 --title：预览不包含报告标题")
+        if args.csv_bom:
+            parser.error("--preview 不支持 --csv-bom：BOM 仅用于 CSV 文件导出")
     elif args.output is None:
         parser.error("缺少 --output：导出模式必须提供输出文件路径")
     # 显式提供 --description（即使为空）时只允许 HTML 格式；
@@ -1205,6 +1253,11 @@ def parse_args(argv):
             )
         if args.title.strip() == "":
             parser.error("--title 的标题去除首尾空白后不能为空")
+    # --csv-bom 仅用于 CSV 文件导出：到这里的 html 分支拒绝（预览已在上面
+    # 单独拒绝）；省略 --format 与显式 --format csv 的文件导出均可使用。
+    # 此判定在读取任何输入文件之前
+    if args.csv_bom and args.format != "csv":
+        parser.error("--csv-bom 仅支持 CSV 格式：HTML 报告不写入 BOM")
     args.params = parse_param_options(args.param, parser)
     # --params-file 的结构性规则在读取任何文件之前判定：只能提供一次，
     # 路径不能为空。重复提供或缺路径属参数错误，此时绝不读取参数文件。
@@ -1297,6 +1350,7 @@ def main(argv=None):
                 args.output,
                 params=args.params,
                 null_text=args.null_text,
+                csv_bom=args.csv_bom,
             )
         else:
             row_count = export_html(
