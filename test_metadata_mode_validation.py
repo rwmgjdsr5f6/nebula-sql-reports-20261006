@@ -78,6 +78,7 @@ FIXED_EXTRA_ORDER = [
     "--params-file",
     "--null-text",
     "--description",
+    "--description-file",
     "--title",
 ]
 
@@ -243,6 +244,7 @@ class LegalMetadataOutputTest(_SampleDbTestCase):
 def _single_conflict_cases(tmpdir, include_describe):
     missing_sql = os.path.join(tmpdir, "no_such_query.sql")
     missing_params = os.path.join(tmpdir, "no_such_params.json")
+    missing_desc = os.path.join(tmpdir, "no_such_notes.txt")
     out_path = os.path.join(tmpdir, "must_not_exist.csv")
     cases = [
         (["--sql", "SELECT 1"], "--sql"),
@@ -256,6 +258,7 @@ def _single_conflict_cases(tmpdir, include_describe):
         # 空字符串也是“已提供”，不得放行
         (["--null-text", ""], "--null-text"),
         (["--description", ""], "--description"),
+        (["--description-file", missing_desc], "--description-file"),
         (["--title", ""], "--title"),
     ]
     if include_describe:
@@ -307,6 +310,7 @@ class ConflictRejectionTest(_SampleDbTestCase):
             ("--sql-file", os.path.join(self.tmpdir, "q.sql")),
             ("--null-text", ""),
             ("--description", ""),
+            ("--description-file", os.path.join(self.tmpdir, "d.txt")),
             ("--sql", "SELECT 1"),
         ]
 
