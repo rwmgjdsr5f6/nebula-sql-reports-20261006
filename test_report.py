@@ -2973,6 +2973,397 @@ class HtmlDescriptionTestCase(unittest.TestCase):
             self.assertEqual(f.read(), original_bytes)
 
 
+# ---- HTML 说明文件（--description-file / read_description_file）----
+# 与验收相同的 people/notes 合成样例与两行说明文件：第一行中文，第二行
+# <script> 形态文本，页面必须只按文字显示且不产生脚本
+DESCFILE_TEXT = "筛选小明\n<script>仅说明</script>\n"
+DESCFILE_ESCAPED = html.escape(DESCFILE_TEXT)
+# 选中小明且未指定空值标记时的完整表格期望：NULL 显示为空单元格
+DESCFILE_EXPECTED_ROWS = [
+    [("th", "姓名"), ("th", "备注")],
+    [("td", "小明"), ("td", "")],
+]
+
+
+class HtmlDescriptionFileTestCase(unittest.TestCase):
+    """--description-file 命令行选项与 read_description_file 的回归测试。
+
+    每个用例独立准备临时目录与 people/notes 样例库（小明备注为 NULL，
+    小红备注为含逗号、双引号的中文）；tearDown 重新只读打开源库，核对
+    两表结构及全部数据相对基线零变化。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmpdir = self._tmp.name
+        self.db_path = os.path.join(self.tmpdir, "sample.sqlite")
+        self._prepare_db()
+        # 准备完成时的结构与数据基线，tearDown 中逐一核对
+        self._baseline = self._snapshot_db()
+        # 查询文件与说明文件：内容固定，用例结束核对字节未被改写
+        self.sql_path = os.path.join(self.tmpdir, "query.sql")
+        with open(self.sql_path, "w", encoding="utf-8", newline="") as f:
+            f.write(DESC_SQL + ";\n")
+        self.notes_path = os.path.join(self.tmpdir, "notes.txt")
+        self._write_desc_file(self.notes_path, DESCFILE_TEXT)
+
+    def tearDown(self):
+        self.assertEqual(self._snapshot_db(), self._baseline)
+        self._tmp.cleanup()
+
+    def _prepare_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE people ("
+                "id INTEGER PRIMARY KEY, name TEXT NOT NULL)"
+            )
+            conn.execute(
+                "CREATE TABLE notes ("
+                "person_id INTEGER PRIMARY KEY, note TEXT)"
+            )
+            conn.executemany(
+                "INSERT INTO people (id, name) VALUES (?, ?)",
+                [(1, "小明"), (2, "小红")],
+            )
+            conn.executemany(
+                "INSERT INTO notes (person_id, note) VALUES (?, ?)",
+                [(1, None), (2, NOTE_VALUE)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _snapshot_db(self):
+        uri = "file:%s?mode=ro" % os.path.abspath(self.db_path)
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            schema = conn.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            ).fetchall()
+            people = conn.execute(
+                "SELECT id, name FROM people ORDER BY id"
+            ).fetchall()
+            notes = conn.execute(
+                "SELECT person_id, note FROM notes ORDER BY person_id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return {"schema": schema, "people": people, "notes": notes}
+
+    @staticmethod
+    def _write_desc_file(path, text, bom=False):
+        data = text.encode("utf-8")
+        if bom:
+            data = b"\xef\xbb\xbf" + data
+        with open(path, "wb") as f:
+            f.write(data)
+
+    @staticmethod
+    def _read_bytes(path):
+        with open(path, "rb") as f:
+            return f.read()
+
+    @staticmethod
+    def _description_block(text):
+        """取出主标题与结果表格之间的页面片段（说明区域所在位置）。"""
+        head_end = text.index(DESC_H1) + len(DESC_H1)
+        table_start = text.index("<table>")
+        return text[head_end:table_start]
+
+    def _run_cli(self, output=None, extra=(), fmt="html", db=None,
+                 sql_file="__default__", preview=None):
+        cmd = [sys.executable, REPORT_PY, "--db", db or self.db_path]
+        if sql_file == "__default__":
+            cmd += ["--sql-file", self.sql_path]
+        elif sql_file is not None:
+            cmd += ["--sql-file", sql_file]
+        if output is not None:
+            cmd += ["--output", output]
+        if fmt is not None:
+            cmd += ["--format", fmt]
+        if preview is not None:
+            cmd += ["--preview", str(preview)]
+        cmd += list(extra)
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+
+    def _out(self, name="result.html"):
+        return os.path.join(self.tmpdir, name)
+
+    # -- 验收路径：两行说明只按文字显示，不生成脚本 --------------------------
+
+    def test_cli_two_line_description_shown_as_text_without_script(self):
+        out = self._out()
+        proc = self._run_cli(
+            out,
+            extra=["--param", "who=小明",
+                   "--description-file", self.notes_path],
+        )
+        # 退出码、导出行数提示与原 HTML 导出一致，标准错误为空
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertEqual(proc.stdout, "已导出 1 行数据：%s\n" % out)
+
+        text = self._read_bytes(out).decode("utf-8")
+        # 两行说明完整显示在主标题之后、结果表格之前，<script> 只按文字转义
+        block = self._description_block(text)
+        self.assertIn("筛选小明", block)
+        self.assertIn("&lt;script&gt;仅说明&lt;/script&gt;", block)
+        self.assertNotIn("<script", text)
+        # 说明不进入页面标题
+        self.assertIn("<title>查询报告</title>", text)
+        # 表格仍为姓名、备注两列和小明的一行，NULL 按原规则显示为空单元格
+        parser = _HtmlTableParser()
+        parser.feed(text)
+        parser.close()
+        self.assertEqual(parser.tables, [DESCFILE_EXPECTED_ROWS])
+        # 说明文件与查询文件只被读取，字节未被改写
+        self.assertEqual(
+            self._read_bytes(self.notes_path), DESCFILE_TEXT.encode("utf-8")
+        )
+
+    def test_cli_same_content_via_description_produces_identical_bytes(self):
+        out_file = self._out("via_file.html")
+        out_inline = self._out("via_inline.html")
+        proc_file = self._run_cli(
+            out_file,
+            extra=["--param", "who=小明",
+                   "--description-file", self.notes_path],
+        )
+        proc_inline = self._run_cli(
+            out_inline,
+            extra=["--param", "who=小明",
+                   "--description", DESCFILE_TEXT],
+        )
+        self.assertEqual(proc_file.returncode, 0, proc_file.stderr)
+        self.assertEqual(proc_inline.returncode, 0, proc_inline.stderr)
+        self.assertEqual(self._read_bytes(out_file), self._read_bytes(out_inline))
+
+    # -- 文件内容规则：BOM、空白保留、空文件 --------------------------------
+
+    def test_function_reads_utf8_strips_one_bom_keeps_whitespace(self):
+        path = os.path.join(self.tmpdir, "带 BOM 的说明.txt")
+        text = "  首行  保留\n\n末行  "
+        self._write_desc_file(path, text, bom=True)
+        self.assertEqual(report.read_description_file(path), text)
+
+    def test_function_strips_only_one_bom(self):
+        path = os.path.join(self.tmpdir, "双BOM.txt")
+        with open(path, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + b"\xef\xbb\xbf" + "说明".encode("utf-8"))
+        # 只剥除开头一个 BOM，第二个作为文字 ﻿ 保留
+        self.assertEqual(report.read_description_file(path), "﻿说明")
+
+    def test_function_missing_directory_and_invalid_utf8_rejected(self):
+        with self.assertRaises(ValueError):
+            report.read_description_file(
+                os.path.join(self.tmpdir, "不存在.txt")
+            )
+        with self.assertRaises(ValueError):
+            report.read_description_file(self.tmpdir)
+        bad = os.path.join(self.tmpdir, "bad.txt")
+        with open(bad, "wb") as f:
+            f.write(b"\xff\xfe")
+        with self.assertRaises(ValueError):
+            report.read_description_file(bad)
+
+    def test_cli_empty_file_byte_identical_to_omitted(self):
+        empty = os.path.join(self.tmpdir, "empty.txt")
+        self._write_desc_file(empty, "")
+        out_empty = self._out("empty.html")
+        out_plain = self._out("plain.html")
+        proc_empty = self._run_cli(
+            out_empty,
+            extra=["--param", "who=小明", "--description-file", empty],
+        )
+        proc_plain = self._run_cli(out_plain, extra=["--param", "who=小明"])
+        self.assertEqual(proc_empty.returncode, 0, proc_empty.stderr)
+        self.assertEqual(proc_plain.returncode, 0, proc_plain.stderr)
+        self.assertEqual(self._read_bytes(out_empty), self._read_bytes(out_plain))
+        # 空文件等价于省略说明：主标题与表格之间没有说明区域
+        text = self._read_bytes(out_empty).decode("utf-8")
+        self.assertEqual(self._description_block(text), "\n")
+
+    def test_cli_whitespace_only_file_still_shows_description_block(self):
+        ws = os.path.join(self.tmpdir, "ws.txt")
+        self._write_desc_file(ws, "  \n\t  \n")
+        out = self._out()
+        proc = self._run_cli(
+            out,
+            extra=["--param", "who=小明", "--description-file", ws],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        text = self._read_bytes(out).decode("utf-8")
+        # 仅含空白的文件仍显示说明区域，空白原样保留
+        self.assertIn(html.escape("  \n\t  \n"), self._description_block(text))
+
+    def test_cli_path_with_chinese_and_spaces_readable(self):
+        subdir = os.path.join(self.tmpdir, "说明 目录")
+        os.mkdir(subdir)
+        path = os.path.join(subdir, "筛选 说明.txt")
+        self._write_desc_file(path, DESCFILE_TEXT)
+        out = self._out()
+        proc = self._run_cli(
+            out,
+            extra=["--param", "who=小明", "--description-file", path],
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        text = self._read_bytes(out).decode("utf-8")
+        self.assertIn("筛选小明", self._description_block(text))
+
+    # -- 用法错误：读取任何输入文件前结束 ------------------------------------
+
+    def _assert_usage_error(self, extra, fmt="html", output="__default__",
+                            expect_file=None, **kwargs):
+        """用法错误公共核对：退出码 1、标准输出为空、标准错误说明参数错误，
+        不创建输出文件；expect_file 给出（不存在的）说明文件路径时，错误
+        必须在读取它之前发生，即标准错误不含文件读取类原因。"""
+        out = self._out("usage.html") if output == "__default__" else output
+        proc = self._run_cli(out, extra=extra, fmt=fmt, **kwargs)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("参数错误", proc.stderr)
+        if expect_file is not None:
+            self.assertNotIn(expect_file, proc.stderr)
+        if output is not None:
+            self.assertFalse(os.path.exists(out))
+        return proc
+
+    def test_cli_mutually_exclusive_with_description_even_empty(self):
+        missing = os.path.join(self.tmpdir, "不存在.txt")
+        for desc in ("任意说明", ""):
+            with self.subTest(description=desc):
+                proc = self._assert_usage_error(
+                    ["--description", desc, "--description-file", missing],
+                    expect_file=missing,
+                )
+                self.assertIn("--description-file", proc.stderr)
+                self.assertIn("--description", proc.stderr)
+
+    def test_cli_repeated_description_file_rejected(self):
+        proc = self._assert_usage_error(
+            ["--description-file", self.notes_path,
+             "--description-file", self.notes_path],
+        )
+        self.assertIn("--description-file", proc.stderr)
+
+    def test_cli_empty_path_rejected(self):
+        proc = self._assert_usage_error(["--description-file", ""])
+        self.assertIn("--description-file", proc.stderr)
+
+    def test_cli_missing_path_value_rejected(self):
+        # --description-file 放在末尾使其后无值可消费，触发缺值错误
+        cmd = [
+            sys.executable, REPORT_PY,
+            "--db", self.db_path,
+            "--sql-file", self.sql_path,
+            "--output", self._out("novalue.html"),
+            "--format", "html",
+            "--description-file",
+        ]
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8"
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("参数错误", proc.stderr)
+        self.assertIn("--description-file", proc.stderr)
+        self.assertFalse(os.path.exists(self._out("novalue.html")))
+
+    def test_cli_csv_and_default_format_rejected(self):
+        for fmt in ("csv", None):
+            with self.subTest(format=fmt):
+                out = self._out("fmt.csv")
+                self._assert_usage_error(
+                    ["--description-file", self.notes_path],
+                    fmt=fmt, output=out,
+                )
+
+    def test_cli_preview_rejected(self):
+        proc = self._run_cli(
+            fmt=None, preview=5,
+            extra=["--description-file", self.notes_path],
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("参数错误", proc.stderr)
+        self.assertIn("--description-file", proc.stderr)
+
+    def test_cli_tables_and_describe_rejected(self):
+        for mode in (["--tables"], ["--describe", "people"]):
+            with self.subTest(mode=mode):
+                cmd = [
+                    sys.executable, REPORT_PY,
+                    "--db", self.db_path,
+                ] + mode + ["--description-file", self.notes_path]
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, encoding="utf-8"
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertEqual(proc.stdout, "")
+                self.assertIn("参数错误", proc.stderr)
+                self.assertIn("--description-file", proc.stderr)
+
+    # -- 文件读取失败：不接触源库、不创建输出 --------------------------------
+
+    def _assert_file_error(self, desc_path, reason_part):
+        out = self._out("fail.html")
+        proc = self._run_cli(
+            out,
+            extra=["--param", "who=小明", "--description-file", desc_path],
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertTrue(proc.stderr.startswith("错误: "), proc.stderr)
+        self.assertIn(reason_part, proc.stderr)
+        self.assertIn(desc_path, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_cli_missing_file_rejected_before_opening_db(self):
+        # 源库同样不存在：先报说明文件错误，证明尚未接触源库
+        missing_db = os.path.join(self.tmpdir, "missing.sqlite")
+        out = self._out("fail.html")
+        proc = self._run_cli(
+            out, db=missing_db,
+            extra=["--description-file",
+                   os.path.join(self.tmpdir, "不存在.txt")],
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertTrue(proc.stderr.startswith("错误: "), proc.stderr)
+        self.assertIn("说明文件", proc.stderr)
+        self.assertFalse(os.path.exists(out))
+        self.assertFalse(os.path.exists(missing_db))
+
+    def test_cli_missing_file_keeps_existing_target_bytes(self):
+        out = self._out("existing.html")
+        original = "已有内容，不得变化\n".encode("utf-8")
+        with open(out, "wb") as f:
+            f.write(original)
+        proc = self._run_cli(
+            out,
+            extra=["--description-file",
+                   os.path.join(self.tmpdir, "不存在.txt")],
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout, "")
+        self.assertTrue(proc.stderr.startswith("错误: "), proc.stderr)
+        self.assertIn("说明文件", proc.stderr)
+        self.assertEqual(self._read_bytes(out), original)
+
+    def test_cli_directory_rejected(self):
+        self._assert_file_error(self.tmpdir, "说明文件")
+
+    def test_cli_invalid_utf8_rejected(self):
+        bad = os.path.join(self.tmpdir, "bad.txt")
+        with open(bad, "wb") as f:
+            f.write(b"\xff\xfe")
+        self._assert_file_error(bad, "UTF-8")
+
+
 # ---- HTML 自定义报告标题（--title / export_html 的 title）----
 # 与验收相同的 people/notes 合成样例：小明备注为 NULL，小红备注含逗号与引号
 TITLE_SQL = (

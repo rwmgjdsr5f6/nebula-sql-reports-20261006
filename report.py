@@ -93,6 +93,21 @@ CSV 导出、HTML 导出与终端预览：与 --sql 或 --sql-file 恰选一个�
 --description（即使为空）而选择 csv 或省略格式时按参数错误拒绝。
 省略说明或传入空字符串时，HTML 输出与未提供说明时逐字节一致。
 
+--description-file PATH 从本地 UTF-8 文件读取查询说明，使同一段说明可
+随查询文件复用：限用于 --format html 的文件导出，仍需 --db、一个查询
+来源与 --output。它与 --description 互斥（即使后者为空字符串也拒绝），
+只能提供一次且路径不能为空；重复提供、缺少路径或路径为空均在读取任何
+输入文件前按参数错误拒绝，也不能与 CSV、默认格式、--preview、--tables
+或 --describe 搭配。文件按 UTF-8 读取，只去掉开头的一个 BOM，其余文字
+原样保留，不裁剪首尾空白；中文、连续空格、换行及 HTML 特殊字符按与
+--description 相同的说明规则显示，位置仍在主标题之后、结果表格之前，
+内容只作为文字，不进入 SQL、页面标题或结果单元格。空文件的输出与省略
+说明时逐字节一致，仅含空白的文件仍显示说明区域；相同内容经
+--description 直接提供时得到相同的输出文件字节。文件不存在、路径是
+目录、不可读或编码无效时，以退出码 1、标准输出为空、标准错误以
+"错误: "开头并说明原因与路径结束，此时不打开源库也不创建输出文件，
+既有目标保持原字节；说明文件只被读取，绝不改写，路径可包含中文与空格。
+
 --title TEXT 为 HTML 报告指定自定义标题：同时用作浏览器页面标题与表格前
 的主标题，默认"查询报告"。标题先去除首尾空白，中文与内部空白保留；
 &、<、>、双引号与单引号按文字转义，不产生额外标签或脚本。标题不进入
@@ -425,6 +440,32 @@ def read_sql_file(path):
         return data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ValueError("查询文件不是有效的 UTF-8 文本 %s：%s" % (path, exc))
+
+
+def read_description_file(path):
+    """读取 --description-file 说明文件文本：按 UTF-8 解码，允许开头恰一个 BOM。
+
+    除剥除开头一个 BOM 外内容原样保留，不裁剪首尾空白；读到的文本与
+    --description 适用完全相同的说明规则（由 export_html 统一处理），
+    因此空文件（或仅含一个 BOM）得到空说明，输出与省略说明时逐字节一致。
+    文件只被读取，绝不改写；路径可包含中文与空格。文件不存在、路径是
+    目录、不可读或编码无效时抛 ValueError，由调用方按统一的“错误: …”
+    失败约定处理，且此时尚未打开源库、未创建输出文件。
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise ValueError("说明文件不存在：%s" % path)
+    except IsADirectoryError:
+        raise ValueError("说明文件路径是目录而非文件：%s" % path)
+    except OSError as exc:
+        raise ValueError("无法读取说明文件 %s：%s" % (path, exc))
+    try:
+        # 与查询文件同一约定：utf-8-sig 仅剥除开头恰一个 BOM
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("说明文件不是有效的 UTF-8 文本 %s：%s" % (path, exc))
 
 
 class _DuplicateJsonObjectKey(Exception):
@@ -981,6 +1022,7 @@ _METADATA_CONFLICT_OPTIONS = (
     ("params_file", "--params-file"),
     ("null_text", "--null-text"),
     ("description", "--description"),
+    ("description_file", "--description-file"),
     ("title", "--title"),
 )
 
@@ -1077,6 +1119,13 @@ def parse_args(argv):
         help="HTML 报告主标题后的纯文本查询说明；仅与 --format html 搭配使用",
     )
     parser.add_argument(
+        "--description-file",
+        action="append",
+        metavar="PATH",
+        help="从 UTF-8 文件读取 HTML 报告的查询说明（允许一个 BOM，内容原样保留）；"
+        "仅与 --format html 的文件导出搭配，与 --description 互斥，只能提供一次",
+    )
+    parser.add_argument(
         "--title",
         metavar="TEXT",
         default=None,
@@ -1119,6 +1168,8 @@ def parse_args(argv):
             parser.error("--preview 仅支持 CSV 格式，不接受 --format html")
         if args.description is not None:
             parser.error("--preview 不支持 --description：预览不包含查询说明文本")
+        if args.description_file is not None:
+            parser.error("--preview 不支持 --description-file：预览不包含查询说明文本")
         if args.title is not None:
             parser.error("--preview 不支持 --title：预览不包含报告标题")
     elif args.output is None:
@@ -1129,6 +1180,27 @@ def parse_args(argv):
         parser.error(
             "--description 仅支持 --format html：CSV 报告不包含查询说明文本"
         )
+    # --description-file 的结构性规则在读取任何输入文件之前判定：只能提供
+    # 一次、路径不能为空，与 --description 互斥（即使后者为空字符串），且
+    # 仅与 --format html 的文件导出搭配。重复提供、缺少路径或路径为空属
+    # 参数错误，此时绝不读取说明文件
+    if args.description_file is not None:
+        if len(args.description_file) > 1:
+            parser.error(
+                "--description-file 只能提供一次，收到 %d 次"
+                % len(args.description_file)
+            )
+        if args.description_file[0] == "":
+            parser.error("--description-file 路径不能为空")
+        if args.description is not None:
+            parser.error(
+                "--description-file 与 --description 互斥，不能同时使用"
+            )
+        if args.format != "html":
+            parser.error(
+                "--description-file 仅支持 --format html："
+                "CSV 报告不包含查询说明文本"
+            )
     # 显式提供 --title 时只允许 HTML 格式；空白标题（去除首尾空白后为空）
     # 同样拒绝，与 export_html 的函数级校验一致
     if args.title is not None:
@@ -1187,6 +1259,15 @@ def main(argv=None):
         except ValueError as exc:
             die(str(exc))
     args.params = merge_params(file_params, args.params)
+    # 说明文件的读取在读取查询文件、打开源库与创建报告之前完成：文件不
+    # 存在、路径是目录、不可读或编码无效时，不读取查询文件、不接触源库、
+    # 不创建任何文件，既有输出目标保持原字节
+    description = args.description
+    if args.description_file is not None:
+        try:
+            description = read_description_file(args.description_file[0])
+        except ValueError as exc:
+            die(str(exc))
     sql_text = args.sql
     if sql_text is None:
         # 再读查询文件：文件类失败时不接触源库与输出目标
@@ -1220,8 +1301,9 @@ def main(argv=None):
                 args.output,
                 params=args.params,
                 null_text=args.null_text,
-                # 未提供 --description 时为 None，与空字符串同样不输出说明区域
-                description=args.description or "",
+                # 未提供说明来源时为 None，与空字符串同样不输出说明区域；
+                # --description-file 已在此前置入 description
+                description=description or "",
                 # 未提供 --title 时为 None，由 export_html 使用默认“查询报告”
                 title=args.title if args.title is not None else "查询报告",
             )
