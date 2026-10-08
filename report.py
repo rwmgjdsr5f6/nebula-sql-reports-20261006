@@ -116,6 +116,17 @@ csv、省略格式或使用 --preview 时按参数错误拒绝，标题缺少文
 首尾空白后为空同样拒绝。省略标题时使用默认"查询报告"，输出与未提供标题
 时逐字节一致；显式提供该默认标题也得到相同文件。
 
+--csv-bom 为不带值的开关（默认关闭），仅用于 CSV 文件导出：开启时在
+输出文件开头写入 UTF-8 BOM（EF BB BF），便于需要该标记的本地软件识别
+含中文的 CSV；省略 --format 或显式 --format csv 时均可使用。BOM 位于
+首个列名之前，不增加字段、列名字符或记录，其后的全部字节与关闭时在
+相同输入下生成的 CSV 完全一致：列顺序、行顺序、空字符串、SQL NULL 的
+替换、中文、逗号、引号和换行均保持现有语义；列名或数据本身含 U+FEFF
+时仍保留该字符。零行查询仍输出 BOM 和表头并返回 0。关闭时输出与未
+提供该开关逐字节一致。该开关与 --format html、--preview、--tables 或
+--describe 混用时按参数错误拒绝：退出码 1，标准输出为空，标准错误以
+"错误: "开头说明原因，在读取输入文件前拒绝且不生成报告。
+
 --preview N 在终端预览前 N 行：仍需 --db 并在 --sql 与 --sql-file 中恰选
 一个来源，可继续使用 --param 和 --null-text，但不要求 --output；同时
 提供 --preview 与 --output 按参数错误拒绝。N 为正整数，缺少值、零、
@@ -698,7 +709,8 @@ def _write_csv_records(fileobj, headers, rows, null_text):
     csv.writer(fileobj).writerows(_csv_records(headers, rows, null_text))
 
 
-def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
+def export_csv(db_path, sql_text, output_path, params=None, null_text="",
+               csv_bom=False):
     """执行查询并将结果独占写入目标 CSV，返回数据行数。任何拒绝路径都不建文件。
 
     params 为可选的 名称->文本 参数字典（键不带占位符前缀），为查询中的
@@ -710,16 +722,34 @@ def export_csv(db_path, sql_text, output_path, params=None, null_text=""):
     （None、数字等）抛 ValueError 且不创建输出文件。空字符串是有效标记；
     标记不影响列名、列顺序、行顺序、非空值与数据行数，源数据中的空字符串
     仍写为空字段。
+
+    csv_bom 为可选的文件编码前缀开关，默认 False：为 True 时在文件开头
+    写入 UTF-8 BOM（EF BB BF），位于首个列名之前，不增加字段、列名字符
+    或记录，其后的全部字节与关闭时在相同输入下生成的 CSV 完全一致；零行
+    查询仍输出 BOM 和表头并返回 0。必须是布尔值，非布尔值抛 ValueError，
+    且在打开源库或创建文件之前拒绝。省略或传入 False 时输出与既有版本
+    逐字节一致。
     """
-    # 三个入口共用同一份查询准备：空值标记类型、参数字典、SQL 与占位符
+    # csv_bom 类型是本入口的专属校验，最先报告（在打开源库与创建文件之前）；
+    # 之后与另外两个入口共用同一份查询准备（空值标记类型、参数字典、SQL、
+    # 占位符）
+    if not isinstance(csv_bom, bool):
+        raise ValueError(
+            "csv_bom 必须是布尔值，收到 %s" % type(csv_bom).__name__
+        )
     statement, bound = _prepare_statement(sql_text, params, null_text)
     # 输入校验通过后先预查输出目录与目标占用，再以只读方式打开源库
     _ensure_output_available(output_path)
     headers, rows = _run_readonly(db_path, statement, bound)
 
-    _write_output_file(
-        output_path, lambda f: _write_csv_records(f, headers, rows, null_text)
-    )
+    def write_csv(f):
+        # BOM 只是编码前缀：U+FEFF 经 utf-8 编码即 EF BB BF，写在首个列名
+        # 之前；其后的 CSV 记录与关闭时逐字节一致
+        if csv_bom:
+            f.write("\ufeff")
+        _write_csv_records(f, headers, rows, null_text)
+
+    _write_output_file(output_path, write_csv)
 
     return len(rows)
 
@@ -1025,6 +1055,7 @@ _METADATA_CONFLICT_OPTIONS = (
     ("description", "--description"),
     ("description_file", "--description-file"),
     ("title", "--title"),
+    ("csv_bom", "--csv-bom"),
 )
 
 
@@ -1134,6 +1165,13 @@ def parse_args(argv):
         help="HTML 报告的自定义标题（浏览器标题与主标题，默认“查询报告”）；"
         "仅与 --format html 搭配使用",
     )
+    parser.add_argument(
+        "--csv-bom",
+        action="store_true",
+        default=None,
+        help="在 CSV 导出文件开头写入 UTF-8 BOM（EF BB BF）；仅用于 CSV "
+        "文件导出，不能与 --format html、--preview、--tables 或 --describe 同用",
+    )
     args = parser.parse_args(argv)
     if args.tables:
         # 表名列举是独立模式：除帮助外仅接受 --db 与 --tables。
@@ -1157,6 +1195,10 @@ def parse_args(argv):
         args.format = "csv"
     if args.null_text is None:
         args.null_text = ""
+    # --csv-bom 以 None 区分"未提供"（供元数据模式混用判定），进入查询/
+    # 导出/预览模式后归一化为布尔值
+    csv_bom = args.csv_bom is True
+    args.csv_bom = csv_bom
     # 恰好选择一个查询来源；此判定发生在读文件与开库之前
     if (args.sql is None) == (args.sql_file is None):
         parser.error("--sql 与 --sql-file 必须恰好选择一个")
@@ -1176,8 +1218,14 @@ def parse_args(argv):
             )
         if args.title is not None:
             parser.error("--preview 不支持 --title：预览不包含报告标题")
+        if args.csv_bom:
+            parser.error("--preview 不支持 --csv-bom：预览不创建输出文件")
     elif args.output is None:
         parser.error("缺少 --output：导出模式必须提供输出文件路径")
+    # --csv-bom 仅用于 CSV 文件导出：与 --format html 混用在读取任何
+    # 输入文件之前拒绝
+    if args.csv_bom and args.format != "csv":
+        parser.error("--csv-bom 仅支持 CSV 文件导出，不接受 --format html")
     # 显式提供 --description（即使为空）时只允许 HTML 格式；
     # 以 None 区分"未提供"与"提供空字符串"
     if args.description is not None and args.format != "html":
@@ -1297,6 +1345,7 @@ def main(argv=None):
                 args.output,
                 params=args.params,
                 null_text=args.null_text,
+                csv_bom=args.csv_bom,
             )
         else:
             row_count = export_html(
